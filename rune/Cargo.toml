@@ -1,0 +1,26 @@
+[package]
+name = "chat-bench-rune"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rune = { path = "vendor/rune/crates/rune", features = ["tooling", "frame-profile"] }
+chat-common = { path = "../rust-common" }
+
+[profile.release]
+opt-level = 3
+codegen-units = 16
+lto = false
+debug = false
+incremental = false
+debug-assertions = false
+overflow-checks = false
+
+[patch.crates-io]
+wgpu-hal = { path = "vendor/rune/vendor/wgpu-hal" }
+winit = { path = "vendor/rune/vendor/winit" }
+parley_engine = { path = "vendor/rune/vendor/parley_engine" }
+
+[workspace]
+exclude = ["vendor"]

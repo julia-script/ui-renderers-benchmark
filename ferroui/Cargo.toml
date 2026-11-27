@@ -1,0 +1,28 @@
+[package]
+name = "chat-bench-ferroui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ferroui-base = "=0.5.0"
+ferroui-controls = "=0.5.0"
+ferroui-view = { version = "=0.5.0", features = ["desktop"] }
+ferroui-themes-fluent = "=0.5.0"
+ferroui-desktop = "=0.5.0"
+ferroui-skia = "=0.5.0"
+ferroui-headless = "=0.5.0"
+chat-common = { path = "../rust-common" }
+
+[patch.crates-io]
+ferroui-base = { path = "vendor/ferroui-base" }
+
+[profile.release]
+opt-level = 3
+codegen-units = 16
+debug = false
+debug-assertions = false
+overflow-checks = false
+
+[workspace]
+exclude = ["vendor"]

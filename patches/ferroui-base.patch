@@ -1,0 +1,240 @@
+diff -ruN a/bench_prof.rs b/bench_prof.rs
+--- a/bench_prof.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/bench_prof.rs	2026-11-27 21:02:14.166154558 +0000
+@@ -0,0 +1,162 @@
++//! Lightweight atomic phase profiler inside ferroui-base for chat-bench.
++use std::cell::Cell;
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++use std::time::Instant;
++
++pub static STYLE_NS: AtomicU64 = AtomicU64::new(0);
++pub static LAYOUT_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
++pub static STYLE_IN_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
++pub static TEXT_SHAPE_NS: AtomicU64 = AtomicU64::new(0);
++pub static TEXT_SHAPE_IN_LAYOUT_NS: AtomicU64 = AtomicU64::new(0);
++pub static TEXT_SHAPE_IN_PAINT_NS: AtomicU64 = AtomicU64::new(0);
++pub static TEXT_SHAPE_CALLS: AtomicU64 = AtomicU64::new(0);
++pub static PAINT_PREP_NS: AtomicU64 = AtomicU64::new(0);
++pub static RASTER_NS: AtomicU64 = AtomicU64::new(0);
++
++thread_local! {
++    static IN_LAYOUT: Cell<u32> = const { Cell::new(0) };
++    static IN_STYLE: Cell<u32> = const { Cell::new(0) };
++    static IN_TEXT: Cell<u32> = const { Cell::new(0) };
++    static IN_PAINT: Cell<u32> = const { Cell::new(0) };
++    static IN_RASTER: Cell<u32> = const { Cell::new(0) };
++}
++
++#[derive(Default, Debug, Clone, Copy)]
++pub struct Snapshot {
++    pub style_ns: u64,
++    pub style_in_layout_ns: u64,
++    pub layout_total_ns: u64,
++    pub text_shape_ns: u64,
++    pub text_shape_in_layout_ns: u64,
++    pub text_shape_in_paint_ns: u64,
++    pub text_shape_calls: u64,
++    pub paint_prep_ns: u64,
++    pub raster_ns: u64,
++}
++
++pub fn reset() {
++    STYLE_NS.store(0, Relaxed);
++    STYLE_IN_LAYOUT_NS.store(0, Relaxed);
++    LAYOUT_TOTAL_NS.store(0, Relaxed);
++    TEXT_SHAPE_NS.store(0, Relaxed);
++    TEXT_SHAPE_IN_LAYOUT_NS.store(0, Relaxed);
++    TEXT_SHAPE_IN_PAINT_NS.store(0, Relaxed);
++    TEXT_SHAPE_CALLS.store(0, Relaxed);
++    PAINT_PREP_NS.store(0, Relaxed);
++    RASTER_NS.store(0, Relaxed);
++}
++
++pub fn snapshot() -> Snapshot {
++    Snapshot {
++        style_ns: STYLE_NS.load(Relaxed),
++        style_in_layout_ns: STYLE_IN_LAYOUT_NS.load(Relaxed),
++        layout_total_ns: LAYOUT_TOTAL_NS.load(Relaxed),
++        text_shape_ns: TEXT_SHAPE_NS.load(Relaxed),
++        text_shape_in_layout_ns: TEXT_SHAPE_IN_LAYOUT_NS.load(Relaxed),
++        text_shape_in_paint_ns: TEXT_SHAPE_IN_PAINT_NS.load(Relaxed),
++        text_shape_calls: TEXT_SHAPE_CALLS.load(Relaxed),
++        paint_prep_ns: PAINT_PREP_NS.load(Relaxed),
++        raster_ns: RASTER_NS.load(Relaxed),
++    }
++}
++
++pub struct StyleScope(Option<Instant>);
++impl StyleScope {
++    #[inline]
++    pub fn enter() -> Self {
++        let d = IN_STYLE.with(|c| { let v = c.get(); c.set(v + 1); v });
++        Self(if d == 0 { Some(Instant::now()) } else { None })
++    }
++}
++impl Drop for StyleScope {
++    #[inline]
++    fn drop(&mut self) {
++        IN_STYLE.with(|c| c.set(c.get().saturating_sub(1)));
++        if let Some(t0) = self.0 {
++            let dt = t0.elapsed().as_nanos() as u64;
++            STYLE_NS.fetch_add(dt, Relaxed);
++            if IN_LAYOUT.with(|c| c.get() > 0) {
++                STYLE_IN_LAYOUT_NS.fetch_add(dt, Relaxed);
++            }
++        }
++    }
++}
++
++pub struct LayoutScope(Option<Instant>);
++impl LayoutScope {
++    #[inline]
++    pub fn enter() -> Self {
++        let d = IN_LAYOUT.with(|c| { let v = c.get(); c.set(v + 1); v });
++        Self(if d == 0 { Some(Instant::now()) } else { None })
++    }
++}
++impl Drop for LayoutScope {
++    #[inline]
++    fn drop(&mut self) {
++        IN_LAYOUT.with(|c| c.set(c.get().saturating_sub(1)));
++        if let Some(t0) = self.0 {
++            LAYOUT_TOTAL_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
++        }
++    }
++}
++
++pub struct TextScope(Option<Instant>);
++impl TextScope {
++    #[inline]
++    pub fn enter() -> Self {
++        TEXT_SHAPE_CALLS.fetch_add(1, Relaxed);
++        let d = IN_TEXT.with(|c| { let v = c.get(); c.set(v + 1); v });
++        Self(if d == 0 { Some(Instant::now()) } else { None })
++    }
++}
++impl Drop for TextScope {
++    #[inline]
++    fn drop(&mut self) {
++        IN_TEXT.with(|c| c.set(c.get().saturating_sub(1)));
++        if let Some(t0) = self.0 {
++            let dt = t0.elapsed().as_nanos() as u64;
++            TEXT_SHAPE_NS.fetch_add(dt, Relaxed);
++            if IN_LAYOUT.with(|c| c.get() > 0) {
++                TEXT_SHAPE_IN_LAYOUT_NS.fetch_add(dt, Relaxed);
++            } else if IN_PAINT.with(|c| c.get() > 0) {
++                TEXT_SHAPE_IN_PAINT_NS.fetch_add(dt, Relaxed);
++            }
++        }
++    }
++}
++
++pub struct PaintScope(Option<Instant>);
++impl PaintScope {
++    #[inline]
++    pub fn enter() -> Self {
++        let d = IN_PAINT.with(|c| { let v = c.get(); c.set(v + 1); v });
++        Self(if d == 0 { Some(Instant::now()) } else { None })
++    }
++}
++impl Drop for PaintScope {
++    #[inline]
++    fn drop(&mut self) {
++        IN_PAINT.with(|c| c.set(c.get().saturating_sub(1)));
++        if let Some(t0) = self.0 {
++            PAINT_PREP_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
++        }
++    }
++}
++
++pub struct RasterScope(Option<Instant>);
++impl RasterScope {
++    #[inline]
++    pub fn enter() -> Self {
++        let d = IN_RASTER.with(|c| { let v = c.get(); c.set(v + 1); v });
++        Self(if d == 0 { Some(Instant::now()) } else { None })
++    }
++}
++impl Drop for RasterScope {
++    #[inline]
++    fn drop(&mut self) {
++        IN_RASTER.with(|c| c.set(c.get().saturating_sub(1)));
++        if let Some(t0) = self.0 {
++            RASTER_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
++        }
++    }
++}
+diff -ruN a/layout/layout_manager.rs b/layout/layout_manager.rs
+--- a/layout/layout_manager.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/layout/layout_manager.rs	2026-11-27 21:58:41.117968702 +0000
+@@ -461,6 +461,7 @@
+             self.to_arrange.borrow_mut().begin_loop(MAX_PASSES);
+ 
+             self.running.set(true);
++            let _layout_prof = crate::bench_prof::LayoutScope::enter();
+             {
+                 let _guard = RunningGuard(&self.running);
+                 self.total_pass_count.set(self.total_pass_count.get() + 1);
+@@ -535,6 +536,7 @@
+ 
+         self.running.set(true);
+         {
++            let _layout_prof = crate::bench_prof::LayoutScope::enter();
+             let _guard = RunningGuard(&self.running);
+             Self::measure(&root);
+             Self::arrange(&root);
+diff -ruN a/lib.rs b/lib.rs
+--- a/lib.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/lib.rs	2026-11-27 21:02:58.029810060 +0000
+@@ -5,6 +5,7 @@
+ pub use paste::paste as __paste;
+ 
+ pub mod animation;
++pub mod bench_prof;
+ pub mod collections;
+ pub mod controls;
+ pub mod data;
+diff -ruN a/media/text_formatting/text_shaper.rs b/media/text_formatting/text_shaper.rs
+--- a/media/text_formatting/text_shaper.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/media/text_formatting/text_shaper.rs	2026-11-27 21:03:02.494176497 +0000
+@@ -34,6 +34,7 @@
+ 
+     /// Shapes UTF-16 text.
+     pub fn shape_text(&self, text: &ReadOnlyMemory<u16>, options: &TextShaperOptions) -> Rc<ShapedBuffer> {
++        let _text_prof = crate::bench_prof::TextScope::enter();
+         crate::perf_count!(TextRunsShaped);
+         self.platform_impl.shape_text(text, options)
+     }
+diff -ruN a/rendering/composition/compositing_renderer.rs b/rendering/composition/compositing_renderer.rs
+--- a/rendering/composition/compositing_renderer.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/rendering/composition/compositing_renderer.rs	2026-11-27 21:03:03.782282047 +0000
+@@ -735,6 +735,7 @@
+     }
+ 
+     fn update_core(&self) {
++        let _paint_prof = crate::bench_prof::PaintScope::enter();
+         self.queued_update.set(false);
+         // Before anything is synchronized: a visual that is still out of the tree lets go of
+         // its composition visual here, and its former parent is synchronized below.
+diff -ruN a/rendering/composition/server/server_composition_target.rs b/rendering/composition/server/server_composition_target.rs
+--- a/rendering/composition/server/server_composition_target.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/rendering/composition/server/server_composition_target.rs	2026-11-27 21:03:04.474338721 +0000
+@@ -371,6 +371,7 @@
+     }
+ 
+     pub fn render(self: &Rc<Self>) {
++        let _raster_prof = crate::bench_prof::RasterScope::enter();
+         self.drew_frame.set(false);
+         self.only_presented_held_frame.set(false);
+         if self.frame_times.borrow().is_none() && self.slow_frame_ms.is_none() {
+diff -ruN a/styled_element.rs b/styled_element.rs
+--- a/styled_element.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/styled_element.rs	2026-11-27 21:02:59.245909973 +0000
+@@ -685,6 +685,7 @@
+                 || !self.theme_applied.get()
+                 || !self.templated_parent_theme_applied.get())
+         {
++            let _style_prof = crate::bench_prof::StyleScope::enter();
+             let values = self.values();
+             values.begin_styling();
+             let _end_styling = EndStyling(self);

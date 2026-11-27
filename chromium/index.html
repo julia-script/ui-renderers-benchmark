@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>chat-bench chromium</title>
+<style>
+@font-face {
+  font-family: "Inter";
+  font-weight: 400;
+  font-style: normal;
+  src: url("/assets/fonts/Inter-Regular.ttf") format("truetype");
+  font-display: block;
+}
+@font-face {
+  font-family: "Inter";
+  font-weight: 700;
+  font-style: normal;
+  src: url("/assets/fonts/Inter-Bold.ttf") format("truetype");
+  font-display: block;
+}
+@font-face {
+  font-family: "Inter";
+  font-weight: 400;
+  font-style: italic;
+  src: url("/assets/fonts/Inter-Italic.ttf") format("truetype");
+  font-display: block;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-weight: 400;
+  font-style: normal;
+  src: url("/assets/fonts/JetBrainsMono-Regular.ttf") format("truetype");
+  font-display: block;
+}
+</style>
+<link rel="stylesheet" href="/data/chat.css">
+</head>
+<body>
+<div class="scroller" id="scroller"></div>
+<script src="/data/chat-data.js"></script>
+<script>
+(() => {
+  const STREAM_WORDS = [
+    "incremental", "layout", "shaping", "glyph", "pipeline", "compositor",
+    "frame", "budget", "viewport", "scroller", "harfbuzz", "rasterizer",
+    "surface", "texture", "quad", "atlas", "baseline", "kerning",
+    "measured", "cached", "retained", "painted", "submitted", "aligned"
+  ];
+
+  const scroller = document.getElementById("scroller");
+  const data = window.CHAT_DATA;
+
+  function makeSpans(parent, spans) {
+    for (let i = 0; i < spans.length; i++) {
+      const [kind, text] = spans[i];
+      if (kind === "N") {
+        parent.appendChild(document.createTextNode(text));
+      } else {
+        const el = document.createElement("span");
+        el.className = kind === "B" ? "b" : kind === "I" ? "i" : kind === "C" ? "ic" : "lnk";
+        el.textContent = text;
+        parent.appendChild(el);
+      }
+    }
+  }
+
+  function makeBlock(b) {
+    if (b.kind === "p") {
+      const el = document.createElement("div");
+      el.className = "p";
+      makeSpans(el, b.spans);
+      return el;
+    }
+    if (b.kind === "h") {
+      const el = document.createElement("div");
+      el.className = "h";
+      el.textContent = b.text;
+      return el;
+    }
+    if (b.kind === "q") {
+      const el = document.createElement("div");
+      el.className = "q";
+      makeSpans(el, b.spans);
+      return el;
+    }
+    if (b.kind === "ul") {
+      const ul = document.createElement("div");
+      ul.className = "ul";
+      for (const item of b.items) {
+        const li = document.createElement("div");
+        li.className = "li";
+        const dot = document.createElement("div");
+        dot.className = "dot";
+        const lt = document.createElement("div");
+        lt.className = "lt";
+        makeSpans(lt, item);
+        li.appendChild(dot);
+        li.appendChild(lt);
+        ul.appendChild(li);
+      }
+      return ul;
+    }
+    if (b.kind === "pre") {
+      const pre = document.createElement("div");
+      pre.className = "pre";
+      for (const line of b.lines) {
+        const cl = document.createElement("div");
+        cl.className = "cl";
+        cl.textContent = line;
+        pre.appendChild(cl);
+      }
+      return pre;
+    }
+    if (b.kind === "table") {
+      const tbl = document.createElement("div");
+      tbl.className = "tbl";
+      for (const cell of b.head) {
+        const th = document.createElement("div");
+        th.className = "th";
+        th.textContent = cell;
+        tbl.appendChild(th);
+      }
+      for (let r = 0; r < b.rows.length; r++) {
+        const odd = (r % 2 === 1);
+        for (const cell of b.rows[r]) {
+          const td = document.createElement("div");
+          td.className = odd ? "td odd" : "td";
+          td.textContent = cell;
+          tbl.appendChild(td);
+        }
+      }
+      return tbl;
+    }
+    if (b.kind === "img") {
+      const fig = document.createElement("div");
+      fig.className = "fig";
+      const img = document.createElement("img");
+      img.className = "pic";
+      img.width = b.width;
+      img.height = b.height;
+      img.decoding = "sync";
+      img.src = "/assets/images/picture-" + (b.picture % 4) + ".png";
+      const cap = document.createElement("div");
+      cap.className = "cap";
+      cap.textContent = b.caption;
+      fig.appendChild(img);
+      fig.appendChild(cap);
+      return fig;
+    }
+    return document.createElement("div");
+  }
+
+  function makeMessage(m) {
+    const msg = document.createElement("div");
+    msg.className = m.mine ? "msg mine" : "msg";
+
+    const head = document.createElement("div");
+    head.className = "msg-head";
+    const av = document.createElement("div");
+    av.className = "avatar";
+    av.textContent = m.initials;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const author = document.createElement("div");
+    author.className = "author";
+    author.textContent = m.author;
+    const time = document.createElement("div");
+    time.className = "time";
+    time.textContent = m.time;
+    meta.appendChild(author);
+    meta.appendChild(time);
+
+    const tags = document.createElement("div");
+    tags.className = "tags";
+    for (const t of m.tags) {
+      const tag = document.createElement("div");
+      tag.className = "tag";
+      tag.textContent = t;
+      tags.appendChild(tag);
+    }
+    head.appendChild(av);
+    head.appendChild(meta);
+    head.appendChild(tags);
+    msg.appendChild(head);
+
+    for (const b of m.blocks) {
+      msg.appendChild(makeBlock(b));
+    }
+
+    if (!m.mine) {
+      const foot = document.createElement("div");
+      foot.className = "foot";
+      for (const label of ["Copy", "Retry", "Cite"]) {
+        const act = document.createElement("div");
+        act.className = "act";
+        act.textContent = label;
+        foot.appendChild(act);
+      }
+      msg.appendChild(foot);
+    }
+    return msg;
+  }
+
+  performance.mark("xb:dom_build:start");
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < data.initialCount; i++) {
+    frag.appendChild(makeMessage(data.messages[i]));
+  }
+  scroller.appendChild(frag);
+  performance.mark("xb:dom_build:end");
+
+  const mode = new URLSearchParams(location.search).get("mode") || "full";
+
+  // Wait for fonts + images + 2 rAFs so initial render is completely settled
+  Promise.all([
+    document.fonts.ready,
+    ...Array.from(document.images).map(img => img.complete ? Promise.resolve() : new Promise(r => { img.onload = img.onerror = r; }))
+  ]).then(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        performance.mark("xb:initial:end");
+        const nodeCount = document.querySelectorAll("*").length;
+        window.__XB_NODES = nodeCount;
+        if (mode === "initial") {
+          window.__XB_DONE = true;
+          document.title = "XB_DONE";
+          return;
+        }
+        // Phase 2: 30 scroll frames (480px per frame = 14,400px sweep)
+        let scrollFrame = 0;
+        const SCROLL_FRAMES = 30;
+        const STREAM_FRAMES = 30;
+        let streamFrame = 0;
+        let streamCard = null;
+        let streamP = null;
+        let streamText = "";
+        let nextExtra = data.initialCount;
+
+        function runScroll() {
+          if (scrollFrame === 0) performance.mark("xb:scroll:start");
+          if (scrollFrame < SCROLL_FRAMES) {
+            scroller.scrollTop = (scrollFrame + 1) * 480;
+            scrollFrame++;
+            requestAnimationFrame(runScroll);
+          } else {
+            requestAnimationFrame(() => {
+              performance.mark("xb:scroll:end");
+              startStream();
+            });
+          }
+        }
+
+        function startStream() {
+          scroller.scrollTop = scroller.scrollHeight;
+          // Create the live streaming assistant card
+          streamCard = makeMessage({
+            id: 9000, mine: false, author: "Assistant", initials: "A", time: "21:00",
+            tags: ["streaming"], blocks: []
+          });
+          streamP = document.createElement("div");
+          streamP.className = "p";
+          streamCard.insertBefore(streamP, streamCard.lastElementChild);
+          scroller.appendChild(streamCard);
+          scroller.scrollTop = scroller.scrollHeight;
+          requestAnimationFrame(() => {
+            performance.mark("xb:stream:start");
+            runStream();
+          });
+        }
+
+        function runStream() {
+          if (streamFrame < STREAM_FRAMES) {
+            // Append 6 words per frame
+            for (let w = 0; w < 6; w++) {
+              const word = STREAM_WORDS[(streamFrame * 6 + w) % STREAM_WORDS.length];
+              streamText += (streamText.length ? " " : "") + word;
+            }
+            streamP.textContent = streamText;
+
+            // Frame 10: start a new paragraph
+            if (streamFrame === 10) {
+              streamP = document.createElement("div");
+              streamP.className = "p";
+              streamCard.insertBefore(streamP, streamCard.lastElementChild);
+              streamText = "";
+            }
+            // Frame 15: append a new user prompt + rich assistant message with a table
+            if (streamFrame === 15) {
+              scroller.appendChild(makeMessage(data.messages[nextExtra++]));
+              scroller.appendChild(makeMessage(data.messages[nextExtra++]));
+              streamCard = makeMessage({
+                id: 9001, mine: false, author: "Assistant", initials: "A", time: "21:01",
+                tags: ["streaming", "table"], blocks: []
+              });
+              streamP = document.createElement("div");
+              streamP.className = "p";
+              streamCard.insertBefore(streamP, streamCard.lastElementChild);
+              scroller.appendChild(streamCard);
+              streamText = "";
+            }
+            // Frame 22: insert an image block into the streaming card
+            if (streamFrame === 22) {
+              const imgBlock = makeBlock({
+                kind: "img", picture: 1, width: 360, height: 202,
+                caption: "Figure live: streamed chart during active response."
+              });
+              streamCard.insertBefore(imgBlock, streamCard.lastElementChild);
+            }
+
+            scroller.scrollTop = scroller.scrollHeight;
+            streamFrame++;
+            requestAnimationFrame(runStream);
+          } else {
+            requestAnimationFrame(() => {
+              performance.mark("xb:stream:end");
+              window.__XB_DONE = true;
+              document.title = "XB_DONE";
+            });
+          }
+        }
+
+        requestAnimationFrame(runScroll);
+      });
+    });
+  });
+})();
+</script>
+</body>
+</html>

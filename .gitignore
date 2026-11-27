@@ -1,0 +1,13 @@
+# Vendored framework checkouts and build outputs
+*/vendor/
+*/target/
+*/build/
+silk/silk.toml
+silk/data
+silk/assets
+data/chat.txt
+data/chat.json
+data/chat-data.js
+results/
+.DS_Store
+__pycache__/

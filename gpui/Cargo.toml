@@ -1,0 +1,21 @@
+[package]
+name = "chat-bench-gpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+gpui = { path = "vendor/zed/crates/gpui", features = ["test-support"] }
+gpui_platform = { path = "vendor/zed/crates/gpui_platform" }
+chat-common = { path = "../rust-common" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = false
+debug-assertions = false
+overflow-checks = false
+
+[workspace]
+exclude = ["vendor"]

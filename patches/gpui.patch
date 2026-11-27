@@ -1,0 +1,113 @@
+diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
+index 5b31a35..1c4ae11 100644
+--- a/crates/gpui/src/gpui.rs
++++ b/crates/gpui/src/gpui.rs
+@@ -20,6 +20,8 @@ pub extern crate subsecond;
+ 
+ extern crate self as gpui;
+ 
++#[allow(missing_docs)]
++pub mod bench_prof;
+ pub mod colors;
+ pub mod prelude;
+ pub mod profiler;
+diff --git a/crates/gpui/src/taffy.rs b/crates/gpui/src/taffy.rs
+index 7c12b5c..d72111a 100644
+--- a/crates/gpui/src/taffy.rs
++++ b/crates/gpui/src/taffy.rs
+@@ -232,6 +232,7 @@ impl TaffyLayoutEngine {
+             transform(available_space.height),
+         );
+ 
++        let _taffy_prof = crate::bench_prof::TaffyScope::enter();
+         self.taffy
+             .compute_layout_with_measure(
+                 id.into(),
+diff --git a/crates/gpui/src/text_system/line_layout.rs b/crates/gpui/src/text_system/line_layout.rs
+index 0686a70..73e85dc 100644
+--- a/crates/gpui/src/text_system/line_layout.rs
++++ b/crates/gpui/src/text_system/line_layout.rs
+@@ -606,6 +606,7 @@ impl LineLayoutCache {
+         Text: AsRef<str>,
+         SharedString: From<Text>,
+     {
++        let _text_prof = crate::bench_prof::TextScope::enter();
+         let _font_generation = self.clear_if_font_generation_changed();
+         let key = &CacheKeyRef {
+             text: text.as_ref(),
+@@ -679,6 +680,7 @@ impl LineLayoutCache {
+         Text: AsRef<str>,
+         SharedString: From<Text>,
+     {
++        let _text_prof = crate::bench_prof::TextScope::enter();
+         let _font_generation = self.clear_if_font_generation_changed();
+         let key = &CacheKeyRef {
+             text: text.as_ref(),
+@@ -705,9 +707,14 @@ impl LineLayoutCache {
+             layout
+         } else {
+             let text = SharedString::from(text);
++            let _t_miss = std::time::Instant::now();
+             let mut layout = self
+                 .platform_text_system
+                 .layout_line(&text, font_size, runs);
++            crate::bench_prof::TEXT_SHAPE_MISS_NS
++                .fetch_add(_t_miss.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
++            crate::bench_prof::TEXT_SHAPE_MISSES
++                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+ 
+             if let Some(force_width) = force_width {
+                 apply_force_width_to_layout(&mut layout, force_width);
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 2875257..1b25c62 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -3742,7 +3742,10 @@ impl Window {
+ 
+         self.layout_engine.as_mut().unwrap().clear();
+         self.text_system().finish_frame();
++        let _t_fin = std::time::Instant::now();
+         self.next_frame.finish(&mut self.rendered_frame);
++        crate::bench_prof::SCENE_FINISH_NS
++            .fetch_add(_t_fin.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+ 
+         self.invalidator.set_phase(DrawPhase::Focus);
+         let previous_focus_path = self.rendered_frame.focus_path();
+@@ -3935,7 +3938,11 @@ impl Window {
+         #[cfg(feature = "profiler")]
+         let request_layout_start = Instant::now();
+         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
+-        let root_layout_id = root_element.request_layout(self, cx);
++        let root_layout_id = {
++            let _req_prof = crate::bench_prof::ReqScope::enter();
++            root_element.request_layout(self, cx)
++        };
++        let _bp_prepaint_start = std::time::Instant::now();
+         #[cfg(feature = "profiler")]
+         let prepaint_start = Instant::now();
+         self.layout_engine
+@@ -3973,8 +3980,13 @@ impl Window {
+         }
+ 
+         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
++        crate::bench_prof::PREPAINT_NS.fetch_add(
++            _bp_prepaint_start.elapsed().as_nanos() as u64,
++            std::sync::atomic::Ordering::Relaxed,
++        );
+ 
+         // Now actually paint the elements.
++        let _bp_paint_start = std::time::Instant::now();
+         #[cfg(feature = "profiler")]
+         let paint_start = Instant::now();
+         self.invalidator.set_phase(DrawPhase::Paint);
+@@ -3995,6 +4007,10 @@ impl Window {
+ 
+         #[cfg(any(feature = "inspector", debug_assertions))]
+         self.paint_inspector_hitbox(cx);
++        crate::bench_prof::PAINT_NS.fetch_add(
++            _bp_paint_start.elapsed().as_nanos() as u64,
++            std::sync::atomic::Ordering::Relaxed,
++        );
+ 
+         #[cfg(feature = "profiler")]
+         self.window_profiler

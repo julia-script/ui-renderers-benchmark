@@ -1,0 +1,9 @@
+[package]
+name = "chat-bench-silk"
+version = "0.1.0"
+silk-version = "@SILK_VERSION@"
+
+[dependencies]
+ui_tree = { path = "@SILKUI@/modules/tree", package = "ui-tree" }
+ui_protocol = { path = "@SILKUI@/modules/protocol", package = "ui-protocol" }
+font_collection = { git = "https://github.com/silk-lang/lib-fonts.git", rev = "@LIB_FONTS@", path = "modules/collection", package = "font-collection" }

@@ -1,0 +1,28 @@
+diff --git a/modules/tree/src/provider.silk b/modules/tree/src/provider.silk
+index ca0a49b..71c6b9d 100644
+--- a/modules/tree/src/provider.silk
++++ b/modules/tree/src/provider.silk
+@@ -24,6 +24,7 @@ import layout.lib {
+ }
+ import silk.collections.list { List }
+ import silk.mem.allocator { Allocator, OutOfMemoryError }
++import silk.trace { Trace as Prof }
+ 
+ pub struct Provider<'a> {
+   pub text: TextSystem<'a>,
+@@ -63,6 +64,7 @@ impl<'a> TextMeasure for Provider<'a> {
+   ) -> TextAnalysis
+     ! OutOfMemoryError | TextError
+     ? &mut Allocator {
++    let _span = Prof.span("ui_tree.text.analyze")
+     return run TextMeasure.analyze(&mut provider.text, context, &mut output)
+   }
+ 
+@@ -73,6 +75,7 @@ impl<'a> TextMeasure for Provider<'a> {
+   )
+     ! OutOfMemoryError | TextError
+     ? &mut Allocator {
++    let _span = Prof.span("ui_tree.text.shape")
+     run TextMeasure.shape(&mut provider.text, request, &mut output)
+   }
+ }
