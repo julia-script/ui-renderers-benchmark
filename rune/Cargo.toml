@@ -7,6 +7,9 @@ publish = false
 [dependencies]
 rune = { path = "vendor/rune/crates/rune", features = ["tooling", "frame-profile"] }
 chat-common = { path = "../rust-common" }
+# Rune's own wgpu (no backends of its own here; Rune's features apply): query sets and buffers
+# for `--windowed`'s GPU timestamps.
+wgpu = { version = "30.0.2", default-features = false }
 
 [profile.release]
 opt-level = 3

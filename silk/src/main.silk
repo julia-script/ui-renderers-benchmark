@@ -1,7 +1,7 @@
-//! Raw ui-tree benchmark on the shared simulated chat session (500 messages + scroll + stream).
+//! Raw ui-tree benchmark on the shared simulated chat session (1000 messages + scroll + stream).
 //! Uses a custom ambient `Tracer` to capture exact nanosecond phase timings inside UiTree:
 //!   - setup (font collection, fonts, images, stylesheet parse)
-//!   - tree build (500 messages via raw ui-tree mutations)
+//!   - tree build (1000 messages via raw ui-tree mutations)
 //!   - style resolution (ui_tree.resolveStyles)
 //!   - text analysis & shaping (ui_tree.text.analyze + ui_tree.text.shape)
 //!   - pure layout (ui_tree.layout minus text analysis & shaping)
@@ -21,6 +21,7 @@ import silk.io.writer_native { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.concurrency.sync { Arc }
 import silk.mem.pointer { Pointer }
+import silk.num.f32
 import silk.num.f64
 import silk.num.i64
 import silk.num.u32
@@ -31,11 +32,20 @@ import silk.system.monotonic_clock { MonotonicClock }
 import silk.system.monotonic_clock_native { OsMonotonicClock }
 import silk.text.string { String, InvalidUtf8 }
 import silk.trace { Tracer, SpanKind, Place, SpanContext }
+import silk.system.host_input { HostInput }
+import silk.collections.bytes { Bytes }
+import ui_tree_window.render_thread { RenderThread, RenderSettings, FastScroll }
+import ui_tree_window.platform_thread { HostPlatform, Launched, launch }
+import ui_tree_window.host { environmentVariable }
+import window.platform { Platform as _Platform }
+import window.event { Event }
+import window.types { Wait, WindowError, WindowId, WindowOptions }
+import webgpu.runtime { GpuError }
 
 const WIDTH: f32 = 1040.0
 const HEIGHT: f32 = 720.0
 const SCALE: f32 = 1.0
-const INITIAL_MESSAGES: usize = 500
+const INITIAL_MESSAGES: usize = 1000
 const SCROLL_FRAMES: usize = 30
 const STREAM_FRAMES: usize = 30
 
@@ -460,8 +470,195 @@ fn nsToMs(ns: u64) -> f64 {
   return u64.toF64(ns) / 1000000.0
 }
 
-effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | OutOfMemoryError ? &mut Allocator {
+// ---------- Windowed mode: a real window, SilkUI's render thread (Dawn/Metal), FIFO present ----------
+
+/// Per-phase sums of what the render thread reported for the frames it drew.
+struct GpuSums {
+  submitNs: u64,
+  prepare: f64,
+  acquire: f64,
+  encode: f64,
+  present: f64,
+  exec: f64,
+  execFrames: u64,
+  submitted: u64,
+  rescrolled: u64,
+  vsyncMisses: u64,
+}
+
+impl GpuSums {
+  fn make() -> GpuSums {
+    return GpuSums {
+      submitNs: 0,
+      prepare: 0.0,
+      acquire: 0.0,
+      encode: 0.0,
+      present: 0.0,
+      exec: 0.0,
+      execFrames: 0,
+      submitted: 0,
+      rescrolled: 0,
+      vsyncMisses: 0,
+    }
+  }
+}
+
+struct Shown {
+  platform: HostPlatform,
+  window: WindowId,
+  renderer: RenderThread,
+  width: f32,
+  height: f32,
+  scale: f64,
+  submitted: u64,
+  lastWidth: u32,
+  lastHeight: u32,
+  fastSeq: u64,
+  sums: GpuSums,
+}
+
+fn deviceSize(logical: f32, scale: f64) -> u32 {
+  return f64.toU32(f64.floor(f32.toF64(logical) * scale + 0.5))
+}
+
+/// Waits for the display's next frame request (vsync, as the window host does), at most 0.25 s.
+effect fn awaitFrame(shown: &mut Shown) -> () ! OutOfMemoryError ? &mut Allocator {
+  shown.platform.requestFrame(shown.window)
+  let started = run nowNs()
+  while true {
+    let next = run shown.platform.nextEvent(Wait.Seconds { seconds: 0.05 })
+    if let Option<Event>.Some { value } = move next {
+      if let Event.RequestFrame { .. } = &value {
+        return ()
+      }
+    }
+    if (run nowNs()) - started > 250000000 {
+      shown.sums.vsyncMisses = shown.sums.vsyncMisses + 1
+      return ()
+    }
+  }
+}
+
+/// Keeps the window alive for `ms` milliseconds (for screenshots), outside every timed section.
+effect fn hold(shown: &mut Shown, ms: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let started = run nowNs()
+  while (run nowNs()) - started < ms * 1000000 {
+    drop run shown.platform.nextEvent(Wait.Seconds { seconds: 0.02 })
+  }
+}
+
+/// Hands the frame just painted to the render thread as the window host does (a frame that only
+/// scrolled its kept scene is drawn again at the new offsets), waits until the GPU has finished
+/// it, and returns when that was, in nanoseconds of the monotonic clock.
+effect fn show(shown: &mut Shown, tree: &mut Tree<'_>, keptBefore: u64, scrollsKeptBefore: u64) -> u64
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let engine = tree.engine()
+  let deviceWidth = deviceSize(shown.width, shown.scale)
+  let deviceHeight = deviceSize(shown.height, shown.scale)
+  let kept = engine.paintsKept > keptBefore
+  let unchanged = shown.submitted > 0 && kept && engine.pendingUploads().entries().length == 0
+    && deviceWidth == shown.lastWidth && deviceHeight == shown.lastHeight
+  let before = shown.renderer.report().frames
+  let s0 = run nowNs()
+  let mut drawn = true
+  if unchanged {
+    if engine.scrollsKept > scrollsKeptBefore {
+      let taken = run shown.renderer.rescroll(engine.scene().scrolls(), shown.fastSeq, FastScroll.make(), false)
+      drawn = taken != shown.fastSeq
+      shown.fastSeq = taken
+      shown.sums.rescrolled = shown.sums.rescrolled + 1
+    } else {
+      drawn = false
+    }
+  } else {
+    run shown.renderer.submit(
+      engine.scene(),
+      &engine.atlas,
+      engine.pendingUploads(),
+      deviceWidth,
+      deviceHeight,
+      false,
+      &[],
+      FastScroll.make(),
+      shown.fastSeq,
+    )
+    shown.submitted = shown.submitted + 1
+    shown.lastWidth = deviceWidth
+    shown.lastHeight = deviceHeight
+    shown.sums.submitted = shown.sums.submitted + 1
+  }
+  tree.clearUploads()
+  let s1 = run nowNs()
+  shown.sums.submitNs = shown.sums.submitNs + (s1 - s0)
+  if !drawn {
+    return s1
+  }
+  let report = run shown.renderer.waitFrames(before + 1)
+  let gpu = shown.renderer.gpuTimes()
+  shown.sums.prepare = shown.sums.prepare + gpu.prepare
+  shown.sums.acquire = shown.sums.acquire + report.acquire
+  shown.sums.encode = shown.sums.encode + report.draw
+  shown.sums.present = shown.sums.present + report.present + gpu.wait
+  if gpu.exec >= 0.0 {
+    shown.sums.exec = shown.sums.exec + gpu.exec
+    shown.sums.execFrames = shown.sums.execFrames + 1
+  }
+  return f64.toU64(gpu.completedAt * 1000000000.0)
+}
+
+effect fn printGpu(sums: &GpuSums, frames: f64) -> () {
+  StderrWriter.print("    \"submit_ms\": {},\n", &.(nsToMs(sums.submitNs) / frames))
+  StderrWriter.print("    \"gpu_prepare_ms\": {},\n", &.(sums.prepare / frames))
+  StderrWriter.print("    \"gpu_acquire_ms\": {},\n", &.(sums.acquire / frames))
+  StderrWriter.print("    \"gpu_encode_ms\": {},\n", &.(sums.encode / frames))
+  if sums.execFrames > 0 {
+    StderrWriter.print("    \"gpu_exec_ms\": {},\n", &.(sums.exec / u64.toF64(sums.execFrames)))
+  }
+  StderrWriter.print("    \"present_ms\": {},\n", &.(sums.present / frames))
+  StderrWriter.print("    \"submitted_frames\": {},\n", &.(sums.submitted))
+  StderrWriter.print("    \"rescrolled_frames\": {},\n", &.(sums.rescrolled))
+  StderrWriter.print("    \"vsync_misses\": {},\n", &.(sums.vsyncMisses))
+}
+
+effect fn holdMs() -> u64 ! OutOfMemoryError ? &mut Allocator {
+  match move run environmentVariable("XB_HOLD_MS") {
+    Option<String>.Some { value } => {
+      let bytes = String.utf8Bytes(String.view(&value))
+      let mut n: u64 = 0
+      let mut i: usize = 0
+      while i < bytes.length {
+        if bytes[i] >= 48 && bytes[i] <= 57 {
+          n = n * 10 + u8.toU64(bytes[i] - 48)
+        }
+        i = i + 1
+      }
+      return n
+    }
+    Option<String>.None => {
+      return 0
+    }
+  }
+}
+
+effect fn gpuCache() -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut path = String.make()
+  if let Option<String>.Some { value } = move run environmentVariable("HOME") {
+    run path.append(String.view(&value))
+    run path.append("/Library/Caches/silk-ui/gpu")
+  }
+  return move path
+}
+
+effect fn runBench(profPtr: *mut ProfState, launched: Option<Launched>) -> () ! TreeError | ProtocolError | WindowError | GpuError | OutOfMemoryError ? &mut Allocator {
   let tStart = run nowNs()
+  let windowed = launched.isSome()
+  // Windowed: the GPU device and pipelines start first, on the render thread, as SilkUI apps do.
+  let mut early = if windowed {
+    Option<RenderThread>.some(run RenderThread.prepare(RenderSettings { check: false, timed: true }, run gpuCache()))
+  } else {
+    Option<RenderThread>.None
+  }
 
   let corpus = run MessageSlices.parse()
   let tCorpus = run nowNs()
@@ -492,7 +689,7 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
   let compiledSheet = style_runtime.runtime().call(Source.read("data/chat.css"))
   let tCss1 = run nowNs()
 
-  // Build 500 messages directly via raw ui-tree
+  // Build 1000 messages directly via raw ui-tree
   let mut tok0 = ()
   let ps0 = unsafe Pointer.borrowMut(&mut tok0, profPtr)
   ps0.reset()
@@ -513,16 +710,69 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
   }
   let tBuild1 = run nowNs()
 
+  // Windowed: open the window (1040 x 720 points) and give the render thread its surface.
+  let mut shown = Option<Shown>.None
+  let mut windowOpenNs: u64 = 0
+  let mut gpuAttachNs: u64 = 0
+  let mut vp = Viewport { width: WIDTH, height: HEIGHT, scale: SCALE }
+  if let Option<Launched>.Some { value: handle } = move launched {
+    let w0 = run nowNs()
+    let mut platform = HostPlatform.proxied(move handle)
+    let mut options = WindowOptions.make("chat-bench-silk", f32.toF64(WIDTH), f32.toF64(HEIGHT))
+    options.resizable = false
+    let window = run platform.openWindow(&options)
+    platform.focus(window)
+    let w1 = run nowNs()
+    let mut renderer = match move Intrinsic.replace(early, Option<RenderThread>.None) {
+      Option<RenderThread>.Some { value } => move value
+      Option<RenderThread>.None => {
+        fail GpuError.status(0)
+      }
+    }
+    run renderer.attach(platform.rawSurface(window), window)
+    let w2 = run nowNs()
+    windowOpenNs = w1 - w0
+    gpuAttachNs = w2 - w1
+    let size = platform.contentSize(window)
+    let scale = platform.scaleFactor(window)
+    vp = Viewport { width: f64.toF32(size.width), height: f64.toF32(size.height), scale: f64.toF32(scale) }
+    shown = Option<Shown>.some(Shown {
+      platform: move platform,
+      window: window,
+      renderer: move renderer,
+      width: vp.width,
+      height: vp.height,
+      scale: scale,
+      submitted: 0,
+      lastWidth: 0,
+      lastHeight: 0,
+      fastSeq: 0,
+      sums: GpuSums.make(),
+    })
+  }
+  let holdFor = if windowed { run holdMs() } else { 0 }
+
   // Initial Frame (Style + Text Shaping + Layout + Paint + Glyph Uploads)
   let mut tok1 = ()
   let ps1 = unsafe Pointer.borrowMut(&mut tok1, profPtr)
   ps1.reset()
   let tFrame0 = run nowNs()
-  let vp = Viewport { width: WIDTH, height: HEIGHT, scale: SCALE }
+  let kb0 = tree.engine().paintsKept
+  let sb0 = tree.engine().scrollsKept
   let _f0 = run tree.frame(vp, 0.0)
   drop _f0
-  tree.clearUploads()
-  let tFrame1 = run nowNs()
+  let tFrame1 = match &mut shown {
+    Option<Shown>.Some { value } => run show(&mut value, &mut tree, kb0, sb0)
+    Option<Shown>.None => {
+      tree.clearUploads()
+      run nowNs()
+    }
+  }
+  let mut initGpu = GpuSums.make()
+  if let Option<Shown>.Some { value } = &mut shown {
+    initGpu = Intrinsic.replace(value.sums, GpuSums.make())
+    if holdFor > 0 { run hold(&mut value, holdFor) }
+  }
 
   let mut tok2 = ()
   let ps = unsafe Pointer.borrowMut(&mut tok2, profPtr)
@@ -544,13 +794,21 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
   let mut scrollFrameNs: u64 = 0
   let mut sf: usize = 0
   while sf < SCROLL_FRAMES {
+    if let Option<Shown>.Some { value } = &mut shown { run awaitFrame(&mut value) }
     let sm0 = run nowNs()
     run tree.scrollTo(scroller, 0.0, usize.toF32((sf + 1) * 480))
     let sm1 = run nowNs()
+    let kb = tree.engine().paintsKept
+    let sb = tree.engine().scrollsKept
     let f = run tree.frame(vp, usize.toF64(sf + 1) * (1.0 / 60.0))
     drop f
-    tree.clearUploads()
-    let sm2 = run nowNs()
+    let sm2 = match &mut shown {
+      Option<Shown>.Some { value } => run show(&mut value, &mut tree, kb, sb)
+      Option<Shown>.None => {
+        tree.clearUploads()
+        run nowNs()
+      }
+    }
     scrollMutNs = scrollMutNs + (sm1 - sm0)
     scrollFrameNs = scrollFrameNs + (sm2 - sm1)
     sf = sf + 1
@@ -562,6 +820,10 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
   let scrollUploadsNs = ps.ns[B_UPLOADS]
   let scrollPaintTotalNs = ps.ns[B_PAINT]
   let scrollPaintPrepNs = if scrollPaintTotalNs > scrollUploadsNs { scrollPaintTotalNs - scrollUploadsNs } else { ps.ns[B_PAINT_ROOTS] + ps.ns[B_SCENE_FINISH] }
+  let mut scrollGpu = GpuSums.make()
+  if let Option<Shown>.Some { value } = &mut shown {
+    scrollGpu = Intrinsic.replace(value.sums, GpuSums.make())
+  }
 
   // Prepare Phase 3: scroll to bottom + create streaming assistant message
   run tree.scrollTo(scroller, 0.0, 10000000.0)
@@ -569,9 +831,18 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
   let mut streamCard = sc0.card
   let mut streamFoot = sc0.foot
   let mut streamTextNode = sc0.textNode
+  if let Option<Shown>.Some { value } = &mut shown { run awaitFrame(&mut value) }
+  let kbp = tree.engine().paintsKept
+  let sbp = tree.engine().scrollsKept
   let _fPrep = run tree.frame(vp, 1.0)
   drop _fPrep
-  tree.clearUploads()
+  match &mut shown {
+    Option<Shown>.Some { value } => {
+      drop run show(&mut value, &mut tree, kbp, sbp)
+      value.sums = GpuSums.make()
+    }
+    Option<Shown>.None => tree.clearUploads()
+  }
 
   let streamWords: [string; 24] = [
     "incremental", "layout", "shaping", "glyph", "pipeline", "compositor",
@@ -587,6 +858,7 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
   let mut nextExtra: usize = INITIAL_MESSAGES
   let mut tf: usize = 0
   while tf < STREAM_FRAMES {
+    if let Option<Shown>.Some { value } = &mut shown { run awaitFrame(&mut value) }
     let tm0 = run nowNs()
     let mut w: usize = 0
     while w < 6 {
@@ -627,10 +899,17 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
 
     run tree.scrollTo(scroller, 0.0, 10000000.0)
     let tm1 = run nowNs()
+    let kb = tree.engine().paintsKept
+    let sb = tree.engine().scrollsKept
     let f = run tree.frame(vp, 2.0 + usize.toF64(tf) * (1.0 / 60.0))
     drop f
-    tree.clearUploads()
-    let tm2 = run nowNs()
+    let tm2 = match &mut shown {
+      Option<Shown>.Some { value } => run show(&mut value, &mut tree, kb, sb)
+      Option<Shown>.None => {
+        tree.clearUploads()
+        run nowNs()
+      }
+    }
     streamMutNs = streamMutNs + (tm1 - tm0)
     streamFrameNs = streamFrameNs + (tm2 - tm1)
     tf = tf + 1
@@ -643,6 +922,11 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
   let streamUploadsNs = ps.ns[B_UPLOADS]
   let streamPaintTotalNs = ps.ns[B_PAINT]
   let streamPaintPrepNs = if streamPaintTotalNs > streamUploadsNs { streamPaintTotalNs - streamUploadsNs } else { ps.ns[B_PAINT_ROOTS] + ps.ns[B_SCENE_FINISH] }
+  let mut streamGpu = GpuSums.make()
+  if let Option<Shown>.Some { value } = &mut shown {
+    streamGpu = Intrinsic.replace(value.sums, GpuSums.make())
+    if holdFor > 0 { run hold(&mut value, holdFor) }
+  }
 
   // Emit JSON result
   let sfN = usize.toF64(SCROLL_FRAMES)
@@ -651,6 +935,11 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
   StderrWriter.print("  \"framework\": \"SilkUI (raw ui-tree)\",\n", &())
   StderrWriter.print("  \"messages\": {},\n", &.(INITIAL_MESSAGES))
   StderrWriter.print("  \"nodes\": {},\n", &.(nodeCount))
+  if windowed {
+    StderrWriter.print("  \"windowed\": true,\n", &())
+    StderrWriter.print("  \"scale\": {},\n", &.(vp.scale))
+    StderrWriter.print("  \"viewport\": [{}, {}],\n", &.(vp.width, vp.height))
+  }
   StderrWriter.print("  \"initial\": {{\n", &())
   StderrWriter.print("    \"corpus_parse_ms\": {},\n", &.(nsToMs(tCorpus - tStart)))
   StderrWriter.print("    \"font_load_ms\": {},\n", &.(nsToMs(tFonts1 - tFonts0)))
@@ -664,6 +953,11 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
   StderrWriter.print("    \"layout_pure_ms\": {},\n", &.(nsToMs(initLayoutPureNs)))
   StderrWriter.print("    \"paint_prep_ms\": {},\n", &.(nsToMs(initPaintPrepNs)))
   StderrWriter.print("    \"glyph_raster_ms\": {},\n", &.(nsToMs(initUploadsNs)))
+  if windowed {
+    StderrWriter.print("    \"window_open_ms\": {},\n", &.(nsToMs(windowOpenNs)))
+    StderrWriter.print("    \"gpu_attach_ms\": {},\n", &.(nsToMs(gpuAttachNs)))
+    run printGpu(&initGpu, 1.0)
+  }
   StderrWriter.print("    \"frame_total_ms\": {},\n", &.(nsToMs(tFrame1 - tFrame0)))
   StderrWriter.print("    \"cold_total_ms\": {}\n", &.(nsToMs(tFrame1 - tStart)))
   StderrWriter.print("  }},\n", &())
@@ -674,6 +968,7 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
   StderrWriter.print("    \"layout_pure_ms\": {},\n", &.(nsToMs(scrollLayoutPureNs) / sfN))
   StderrWriter.print("    \"paint_prep_ms\": {},\n", &.(nsToMs(scrollPaintPrepNs) / sfN))
   StderrWriter.print("    \"glyph_raster_ms\": {},\n", &.(nsToMs(scrollUploadsNs) / sfN))
+  if windowed { run printGpu(&scrollGpu, sfN) }
   StderrWriter.print("    \"frame_total_ms\": {}\n", &.(nsToMs(scrollMutNs + scrollFrameNs) / sfN))
   StderrWriter.print("  }},\n", &())
   StderrWriter.print("  \"stream_per_frame\": {{\n", &())
@@ -683,22 +978,27 @@ effect fn runBench(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | 
   StderrWriter.print("    \"layout_pure_ms\": {},\n", &.(nsToMs(streamLayoutPureNs) / stN))
   StderrWriter.print("    \"paint_prep_ms\": {},\n", &.(nsToMs(streamPaintPrepNs) / stN))
   StderrWriter.print("    \"glyph_raster_ms\": {},\n", &.(nsToMs(streamUploadsNs) / stN))
+  if windowed { run printGpu(&streamGpu, stN) }
   StderrWriter.print("    \"frame_total_ms\": {}\n", &.(nsToMs(streamMutNs + streamFrameNs) / stN))
   StderrWriter.print("  }}\n", &())
   StderrWriter.print("}}\n", &())
+  if let Option<Shown>.Some { value } = &mut shown {
+    value.renderer.stop()
+    value.platform.closeWindow(value.window)
+  }
 }
 
-effect fn runWithTracer(profPtr: *mut ProfState) -> () ! TreeError | ProtocolError | OutOfMemoryError ? &mut Allocator {
+effect fn runWithTracer(profPtr: *mut ProfState, launched: Option<Launched>) -> () ! TreeError | ProtocolError | WindowError | GpuError | OutOfMemoryError ? &mut Allocator {
   let tracer = run Arc<BenchTracer>.make(BenchTracer { state: profPtr })
-  run runBench(profPtr) |> Effect.provideAmbient<Tracer>(&tracer)
+  run runBench(profPtr, move launched) |> Effect.provideAmbient<Tracer>(&tracer)
 }
 
-pub effect fn main() -> i32 {
+fn bench(launched: Option<Launched>) -> i32 {
   let mut alloc = Allocator.systemAllocatorProvider()
   let mut profState = ProfState.make()
   let profPtr = Pointer.fromMutRef(&mut profState)
   let res = run Effect.result(
-    runWithTracer(profPtr) |> Effect.provideMut<Allocator>(&mut alloc),
+    runWithTracer(profPtr, move launched) |> Effect.provideMut<Allocator>(&mut alloc),
   )
   if let Result.Failure { error } = move res {
     drop error
@@ -706,4 +1006,66 @@ pub effect fn main() -> i32 {
     return 1
   }
   return 0
+}
+
+/// `--windowed` (or XB_WINDOWED=1): a real window with SilkUI's GPU renderer and presentation.
+effect fn windowedAsked() -> bool ! OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let counted = run Effect.result(HostInput.argumentCount())
+  let count = match move counted {
+    Result.Success { value } => value
+    Result.Failure { error } => {
+      drop error
+      0
+    }
+  }
+  let mut i: usize = 1
+  while i < count {
+    let read = run Effect.result(HostInput.argument(i))
+    if let Result.Success { value: found } = move read {
+      if let Option<Bytes>.Some { value: arg } = move found {
+        if (String.fromUtf8(arg.asSlice()) |> Result<string, InvalidUtf8>.unwrapOr("")) == "--windowed" {
+          return true
+        }
+      }
+    }
+    i = i + 1
+  }
+  if let Option<String>.Some { value } = move run environmentVariable("XB_WINDOWED") {
+    return String.view(&value) == "1"
+  }
+  return false
+}
+
+pub effect fn main() -> i32 ? &mut HostInput {
+  let mut heap = Allocator.systemAllocatorProvider()
+  let asked = run Effect.result(windowedAsked() |> Effect.provideMut<Allocator>(&mut heap))
+  let windowed = match move asked {
+    Result.Success { value } => value
+    Result.Failure { error } => {
+      drop error
+      false
+    }
+  }
+  if !windowed {
+    return bench(Option<Launched>.None)
+  }
+  // The main thread keeps AppKit's event loop; the bench runs on a UI thread of its own.
+  let launchedRun = run Effect.result(
+    launch(
+      |platform: Option<Launched>| -> i32 {
+        if Option<Launched>.isNone(&platform) {
+          StderrWriter.print("silk chat-bench: no window system\n", &())
+          return 1
+        }
+        return bench(move platform)
+      },
+    ) |> Effect.provideMut<Allocator>(&mut heap),
+  )
+  return match move launchedRun {
+    Result.Success { value } => value
+    Result.Failure { error } => {
+      drop error
+      1
+    }
+  }
 }

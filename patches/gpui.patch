@@ -111,3 +111,75 @@ index 2875257..1b25c62 100644
  
          #[cfg(feature = "profiler")]
          self.window_profiler
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -592,6 +592,8 @@
+     }
+ 
+     pub fn draw(&mut self, scene: &Scene) {
++        let bench_draw_start = std::time::Instant::now();
++        let mut bench_drawable_wait_ns = 0u64;
+         let layer = match &self.layer {
+             Some(l) => l.clone(),
+             None => {
+@@ -610,7 +612,10 @@
+                 drawable
+             }
+             DisplayLinkMode::Detached => {
+-                let Some(drawable) = layer.nextDrawable() else {
++                let bench_wait_start = std::time::Instant::now();
++                let next_drawable = layer.nextDrawable();
++                bench_drawable_wait_ns = bench_wait_start.elapsed().as_nanos() as u64;
++                let Some(drawable) = next_drawable else {
+                     log::error!(
+                         "failed to retrieve next drawable, drawable size: {:?}",
+                         layer.drawableSize()
+@@ -636,6 +641,35 @@
+             }
+         };
+ 
++        // bench_prof: GPU execution time + completion host time of this frame.
++        let bench_completed = RcBlock::new(
++            |command_buffer: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
++                // SAFETY: Metal passes the live command buffer that completed; both
++                // selectors return CFTimeInterval (f64) host times in seconds.
++                let (gpu_start, gpu_end): (f64, f64) = unsafe {
++                    let command_buffer = command_buffer.as_ref();
++                    (
++                        objc2::msg_send![command_buffer, GPUStartTime],
++                        objc2::msg_send![command_buffer, GPUEndTime],
++                    )
++                };
++                gpui::bench_prof::record_gpu_complete(gpu_start, gpu_end);
++            },
++        );
++        // bench_prof: host time the drawable reached the display (0 = dropped).
++        let bench_presented =
++            RcBlock::new(|drawable: ptr::NonNull<ProtocolObject<dyn MTLDrawable>>| {
++                // SAFETY: Metal passes the live drawable that was presented;
++                // `presentedTime` returns a CFTimeInterval (f64) host time.
++                let presented: f64 = unsafe { objc2::msg_send![drawable.as_ref(), presentedTime] };
++                gpui::bench_prof::record_presented(presented);
++            });
++        // SAFETY: Metal copies the blocks and invokes each once; they capture nothing.
++        unsafe {
++            command_buffer.addCompletedHandler(RcBlock::as_ptr(&bench_completed));
++            drawable.addPresentedHandler(RcBlock::as_ptr(&bench_presented));
++        }
++
+         if self.presents_with_transaction {
+             command_buffer.commit();
+             command_buffer.waitUntilScheduled();
+@@ -644,6 +678,11 @@
+             command_buffer.presentDrawable(ProtocolObject::from_ref(&*drawable));
+             command_buffer.commit();
+         }
++        let bench_total_ns = bench_draw_start.elapsed().as_nanos() as u64;
++        gpui::bench_prof::record_commit(
++            bench_total_ns.saturating_sub(bench_drawable_wait_ns),
++            bench_drawable_wait_ns,
++        );
+     }
+ 
+     fn render_frame(

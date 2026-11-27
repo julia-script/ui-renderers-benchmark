@@ -67,8 +67,9 @@ def run_native(name, cmd, runs, use_stderr=False):
         "scroll_per_frame": med_dict([r["scroll_per_frame"] for r in samples]),
         "stream_per_frame": med_dict([r["stream_per_frame"] for r in samples]),
     }
-    if "nodes" in samples[0]:
-        merged["nodes"] = samples[0]["nodes"]
+    for k, v in samples[0].items():
+        if k not in merged and not isinstance(v, dict):
+            merged[k] = v
     out_path = os.path.join(RESULTS, f"{name}.json")
     with open(out_path, "w") as f:
         json.dump(merged, f, indent=2)
@@ -80,16 +81,22 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=3, help="Runs per native framework (default: 3)")
     ap.add_argument("--gpu", action="store_true", help="Enable hardware GPU in Chromium")
+    ap.add_argument("--windowed", action="store_true",
+                    help="Real on-screen windows + GPU rendering + presentation for every engine (takes over the screen)")
     ap.add_argument("targets", nargs="*", help="Subset: silk rune gpui ferroui chromium")
     args = ap.parse_args()
 
     only = set(args.targets) if args.targets else {"silk", "rune", "gpui", "ferroui", "chromium"}
+    wflag = ["--windowed"] if args.windowed else []
+
+    def sfx(name):
+        return f"{name}-windowed" if args.windowed else name
     results = {}
 
     if "silk" in only:
         b = find_silk_bin()
         if b:
-            results["silk"] = run_native("silk", [b], args.runs, use_stderr=True)
+            results["silk"] = run_native(sfx("silk"), [b] + wflag, args.runs, use_stderr=True)
         else:
             print("[silk] binary not built; run ./build.sh silk", file=sys.stderr)
 
@@ -97,7 +104,7 @@ def main():
         if name in only:
             b = os.path.join(ROOT, name, "target", "release", bin_name)
             if os.path.exists(b):
-                results[name] = run_native(name, [b], args.runs)
+                results[name] = run_native(sfx(name), [b] + wflag, args.runs)
             else:
                 print(f"[{name}] binary not built; run ./build.sh {name}", file=sys.stderr)
 
@@ -105,23 +112,41 @@ def main():
         cmd = ["node", os.path.join(ROOT, "chromium", "run_chromium.mjs")]
         if args.gpu:
             cmd.append("--gpu")
-        p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
-        if p.returncode == 0:
-            subprocess.run(["python3", os.path.join(ROOT, "chromium", "parse_trace.py"), os.path.join(RESULTS, "chromium-trace.json")], cwd=ROOT, check=True)
+        if args.windowed:
+            cmd.append("--windowed")
+        samples = []
+        for _ in range(args.runs if args.windowed else 1):
+            p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+            if p.returncode != 0:
+                print(f"[chromium] FAILED:\n{p.stderr}", file=sys.stderr)
+                break
+            subprocess.run(["python3", os.path.join(ROOT, "chromium", "parse_trace.py"), os.path.join(RESULTS, "chromium-trace.json")],
+                           cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
             with open(os.path.join(RESULTS, "chromium.json")) as f:
-                results["chromium"] = json.load(f)
-        else:
-            print(f"[chromium] FAILED:\n{p.stderr}", file=sys.stderr)
+                samples.append(json.load(f))
+        if samples:
+            merged = dict(samples[0])
+            for sec in ("initial", "scroll_per_frame", "stream_per_frame"):
+                merged[sec] = med_dict([x[sec] for x in samples])
+            merged["runs"] = len(samples)
+            merged["gpu"] = args.gpu or args.windowed
+            merged["windowed"] = args.windowed
+            results["chromium"] = merged
+            mode = "chromium-windowed.json" if args.windowed else ("chromium-gpu.json" if args.gpu else "chromium-cpu.json")
+            for fp in ("chromium.json", mode):
+                with open(os.path.join(RESULTS, fp), "w") as f:
+                    json.dump(merged, f, indent=2)
+            print(f"[chromium] {len(samples)}-run median saved -> {mode}")
 
     for k in ("silk", "rune", "gpui", "ferroui", "chromium"):
         if k not in results:
-            fp = os.path.join(RESULTS, f"{k}.json")
+            fp = os.path.join(RESULTS, f"{k}-windowed.json" if args.windowed else f"{k}.json")
             if os.path.exists(fp):
                 with open(fp) as f:
                     results[k] = json.load(f)
 
     print("\n" + "=" * 102)
-    print("INITIAL LOAD (500 rich chat messages -> first complete frame, ms)")
+    print("INITIAL LOAD (1000 rich chat messages -> first complete frame, ms)")
     print("=" * 102)
     print(f"{'Framework':<24} {'Pre-Lay':>9} {'Style':>8} {'Shape':>8} {'Layout':>8} {'PaintPrp':>9} {'Raster':>8} {'ColdTot':>9}")
     for k in ("silk", "rune", "gpui", "ferroui", "chromium"):

@@ -7,3 +7,6 @@ silk-version = "@SILK_VERSION@"
 ui_tree = { path = "@SILKUI@/modules/tree", package = "ui-tree" }
 ui_protocol = { path = "@SILKUI@/modules/protocol", package = "ui-protocol" }
 font_collection = { git = "https://github.com/silk-lang/lib-fonts.git", rev = "@LIB_FONTS@", path = "modules/collection", package = "font-collection" }
+ui_tree_window = { path = "@SILKUI@/modules/tree/window", package = "ui-tree-window" }
+window = { git = "https://github.com/silk-lang/lib-native.git", rev = "df99cfdfa30a510afff635e954a415a66520e926", path = "modules/platform/window", package = "platform-window" }
+webgpu = { git = "https://github.com/silk-lang/lib-native.git", rev = "ae5ebb4e9ba32fd7c74b96293b9e5d8bcd7deabc", path = "modules/gpu/webgpu", package = "gpu-webgpu" }

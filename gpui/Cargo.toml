@@ -6,8 +6,11 @@ publish = false
 
 [dependencies]
 gpui = { path = "vendor/zed/crates/gpui", features = ["test-support"] }
-gpui_platform = { path = "vendor/zed/crates/gpui_platform" }
+# font-kit: real CoreText text system (AppleTextSystem). Without it MacPlatform falls back to
+# NoopTextSystem and windowed mode draws no glyphs. Headless keeps NoopTextSystem explicitly.
+gpui_platform = { path = "vendor/zed/crates/gpui_platform", features = ["font-kit"] }
 chat-common = { path = "../rust-common" }
+log = "0.4"
 
 [profile.release]
 opt-level = 3

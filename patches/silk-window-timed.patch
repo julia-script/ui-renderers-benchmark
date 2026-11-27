@@ -1,0 +1,310 @@
+diff --git a/modules/tree/window/src/host.silk b/modules/tree/window/src/host.silk
+index 235227d..53b15c5 100644
+--- a/modules/tree/window/src/host.silk
++++ b/modules/tree/window/src/host.silk
+@@ -84,7 +84,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
+ 
+   effect fn prepareGpu(check: bool) -> EarlyRenderer
+     ! GpuError | OutOfMemoryError {
+-    return run prepareRenderer(RenderSettings { check: check }, String.make())
++    return run prepareRenderer(RenderSettings { check: check, timed: false }, String.make())
+   }
+ } else {
+   import render_thread { RenderThread }
+@@ -129,7 +129,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
+     } else {
+       run gpuCacheDirectory()
+     }
+-    return run prepareRenderer(RenderSettings { check: check }, move cache)
++    return run prepareRenderer(RenderSettings { check: check, timed: false }, move cache)
+   }
+ }
+ 
+diff --git a/modules/tree/window/src/render_thread.silk b/modules/tree/window/src/render_thread.silk
+index 8bfdf56..fd7a862 100644
+--- a/modules/tree/window/src/render_thread.silk
++++ b/modules/tree/window/src/render_thread.silk
+@@ -54,9 +54,26 @@ import silk.mem.pointer { Pointer }
+ import window.types { RawSurface, WindowId }
+ import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
+ import webgpu.runtime as runtime
+-import webgpu.resources { Queue, Texture, createTexture, getQueue }
++import webgpu.resources {
++  TextureView,
++  Buffer,
++  CommandEncoder,
++  QuerySet,
++  Queue,
++  Texture,
++  createBuffer,
++  createCommandEncoder,
++  createQuerySet,
++  createTexture,
++  getQueue
++}
+ import webgpu.surface { Surface, SurfaceConfiguration, SurfaceTarget }
+ import webgpu.descriptors {
++  BufferDescriptor,
++  PassTimestampWrites,
++  RenderPassColorAttachment,
++  RenderPassDescriptor,
++  QuerySetDescriptor,
+   DeviceDescriptor,
+   Extent3D,
+   TexelCopyBufferLayout,
+@@ -85,6 +102,7 @@ import silk.num.u64
+ import silk.num.i32
+ import silk.num.u32
+ import silk.num.usize
++import silk.num.u8
+ import silk.num.f32
+ import silk.geometry.rect { Rect }
+ 
+@@ -93,6 +111,10 @@ pub struct RenderSettings {
+   /// Check mode: the surface can be read back, and text uses no gamma correction, like the CPU
+   /// reference.
+   pub check: bool,
++  /// Benchmarks: the first window's frames are drawn in one command buffer between timestamp
++  /// queries, and the thread waits for the GPU to finish each frame before it reports it
++  /// ([`RenderThread.gpuTimes`]).
++  pub timed: bool,
+ }
+ 
+ impl Copy for RenderSettings {}
+@@ -138,6 +160,105 @@ impl RenderReport {
+   }
+ }
+ 
++/// GPU timings of the last frame of the first window, for a thread started with
++/// [`RenderThread.prepareTimed`]: such a thread waits for the GPU to finish each frame before
++/// it reports it, so a caller that waits for the frame waits for the GPU too.
++pub struct GpuTimes {
++  /// Milliseconds from the return of the present call to the GPU finishing the frame's work.
++  pub wait: f64,
++  /// Milliseconds the GPU spent on the frame's commands (timestamp queries around the frame's
++  /// passes), -1 when the device has no timestamp queries.
++  pub exec: f64,
++  /// Milliseconds spent reading the timestamps back, after the GPU finished.
++  pub readback: f64,
++  /// Milliseconds from taking the frame to acquiring the drawable: atlas pixel writes and
++  /// adopting the frame.
++  pub prepare: f64,
++  /// When the GPU finished the frame, in seconds of the monotonic clock (`clock.Clock`).
++  pub completedAt: f64,
++}
++
++impl Copy for GpuTimes {}
++
++impl GpuTimes {
++  fn none() -> GpuTimes {
++    return GpuTimes { wait: 0.0, exec: -1.0, readback: 0.0, prepare: 0.0, completedAt: 0.0 }
++  }
++}
++
++/// The timestamp queries of a timed render thread: two empty render passes on a 1x1 texture,
++/// before and after the frame's passes, write the GPU's clock at their start and end (Metal
++/// takes no samples in an empty compute pass).
++struct Stamps {
++  set: QuerySet,
++  resolved: Buffer,
++  read: Buffer,
++  target: Texture,
++  view: TextureView,
++}
++
++const STAMP_BYTES: u64 = 32
++
++effect fn makeStamps(device: &Device) -> Stamps
++  ! GpuError {
++  let mut sets = QuerySetDescriptor.default().withLabel(b"frame stamps")
++  sets.setType(flags.WGPUQueryType_Timestamp)
++  sets.setCount(4)
++  let set = run createQuerySet(device, &sets)
++  let mut resolving = BufferDescriptor.default().withLabel(b"frame stamps resolved")
++  resolving.setUsage(flags.WGPUBufferUsage_QueryResolve | flags.WGPUBufferUsage_CopySrc)
++  resolving.setSize(STAMP_BYTES)
++  let resolved = run createBuffer(device, &resolving)
++  let mut reading = BufferDescriptor.default().withLabel(b"frame stamps read")
++  reading.setUsage(flags.WGPUBufferUsage_MapRead | flags.WGPUBufferUsage_CopyDst)
++  reading.setSize(STAMP_BYTES)
++  let read = run createBuffer(device, &reading)
++  let mut size = Extent3D.default()
++  size.setWidth(1)
++  size.setHeight(1)
++  size.setDepthOrArrayLayers(1)
++  let mut texturing = TextureDescriptor.default().withLabel(b"frame stamps target")
++  texturing.setSize(size)
++  texturing.setFormat(flags.WGPUTextureFormat_RGBA8Unorm)
++  texturing.setDimension(flags.WGPUTextureDimension_2D)
++  texturing.setMipLevelCount(1)
++  texturing.setSampleCount(1)
++  texturing.setUsage(flags.WGPUTextureUsage_RenderAttachment)
++  let target = run createTexture(device, &texturing)
++  let view = run target.createView(&TextureViewDescriptor.default())
++  return Stamps { set: move set, resolved: move resolved, read: move read, target: move target, view: move view }
++}
++
++effect fn stamp(encoder: &mut CommandEncoder, stamps: &Stamps, first: u32) -> ()
++  ! GpuError {
++  let mut writes = PassTimestampWrites.default().withQuerySet(&stamps.set)
++  writes.setBeginningOfPassWriteIndex(first)
++  writes.setEndOfPassWriteIndex(first + 1)
++  let mut color = RenderPassColorAttachment.default().withView(&stamps.view)
++  color.setLoadOp(flags.WGPULoadOp_Clear)
++  color.setStoreOp(flags.WGPUStoreOp_Discard)
++  let colors = [color]
++  let descriptor = RenderPassDescriptor.default().withLabel(b"frame stamp").withColorAttachments(&colors).withTimestampWrites(&writes)
++  let pass = run encoder.beginRenderPass(&descriptor)
++  pass.end()
++}
++
++fn stampAt(bytes: &[u8], index: usize) -> u64 {
++  let mut value: u64 = 0
++  let mut i: usize = 0
++  while i < 8 {
++    value = value | u64.shiftLeft(u8.toU64(bytes[index * 8 + i]), usize.toU64(i * 8))
++    i = i + 1
++  }
++  return value
++}
++
++fn recordGpu(shared: &Arc<Mutex<State>>, times: GpuTimes) -> () {
++  let mut guard = shared.get().lock()
++  let values = guard.getMut()
++  values.gpu = times
++}
++
+ /// The window's native surface, sent once to the render thread. The pointers it holds belong to
+ /// the window, which outlives the render thread: [`RenderThread.stop`] joins it before the
+ /// window closes.
+@@ -294,6 +415,8 @@ struct State {
+   framing: bool,
+   /// GPU canvases may show in layers of their own ([`RenderThread.allowCanvasLayers`]).
+   layersAllowed: bool,
++  /// The last frame's GPU timings, for a timed thread.
++  gpu: GpuTimes,
+ }
+ 
+ impl Transferable for State {}
+@@ -559,6 +682,11 @@ impl RenderThread {
+     return self.shared.get().lock().get().report
+   }
+ 
++  /// The GPU timings of the last frame, for a thread started with `RenderSettings.timed`.
++  pub fn gpuTimes(self: &Self) -> GpuTimes {
++    return self.shared.get().lock().get().gpu
++  }
++
+   /// Shows or hides the Metal Performance HUD over the window's frames (macOS 13 and later;
+   /// elsewhere nothing happens). It measures what the window's layer presents.
+   pub fn setMetalHud(self: &mut Self, on: bool) -> () {
+@@ -975,6 +1103,7 @@ effect fn makeShared() -> Arc<Mutex<State>>
+     grabbed: Option<Grab>.None,
+     framing: false,
+     layersAllowed: false,
++    gpu: GpuTimes.none(),
+   }
+   return run Arc<Mutex<State>>.make(run Mutex<State>.make(move state))
+ }
+@@ -2020,7 +2149,16 @@ effect fn renderLoop(
+   let mut adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+   // With the features that share GPU canvas images with the apps' devices, when the adapter
+   // has them (gpu_canvas.silk): the canvases then reach this device without a copy.
+-  let deviceOptions = DeviceDescriptor.cachedIn(String.utf8Bytes(cache)).withRequiredFeatures(sharingFeatures(&adapter))
++  let mut features = List<u32>.make()
++  run features.appendSlice(sharingFeatures(&adapter))
++  let stamped = settings.timed && adapter.hasFeature(flags.WGPUFeatureName_TimestampQuery)
++  if stamped {
++    run features.append(flags.WGPUFeatureName_TimestampQuery)
++  }
++  if settings.timed && !stamped {
++    StderrWriter.print("ui-tree: the adapter has no timestamp queries: no GPU execution times\n", &())
++  }
++  let deviceOptions = DeviceDescriptor.cachedIn(String.utf8Bytes(cache)).withRequiredFeatures(features.asSlice())
+   let mut device = run adapter.requestDevice(&deviceOptions)
+   canvases.setSharing(SharedImage.supported(&device))
+   let mut queue = run getQueue(&device)
+@@ -2069,6 +2207,11 @@ effect fn renderLoop(
+     renderer = run UiRenderer.make(&device, format)
+   }
+   let mut textures = GpuAtlas.make()
++  let stamps = if stamped && device.hasFeature(flags.WGPUFeatureName_TimestampQuery) {
++    Option<Stamps>.some(run makeStamps(&device))
++  } else {
++    Option<Stamps>.None
++  }
+   let mut configuration = SurfaceConfiguration.make(&device, format, 1, 1)
+   // A surface that can be read back takes the frame directly: the renderer copies what is
+   // under a blurred or blended layer from it, instead of drawing the frame into a texture as
+@@ -2152,6 +2295,7 @@ effect fn renderLoop(
+       _ => false
+     }
+     let mut windowCanvas = polling
++    let workStart = run seconds(&mut clock)
+     if !quitting && !polling {
+       let hud = takeHud(shared)
+       if hud >= 0 {
+@@ -2253,7 +2397,31 @@ effect fn renderLoop(
+       renderer.reuseInstances()
+     }
+     held = true
+-    if canCopy {
++    if settings.timed {
++      // One command buffer, as `draw` submits, between two timestamp passes.
++      let mut encoder = run createCommandEncoder(&device, b"ui frame")
++      if let Option<Stamps>.Some { value: s } = &stamps {
++        run stamp(&mut encoder, &s, 0)
++      }
++      run renderer.encode(
++        &device,
++        &queue,
++        &mut encoder,
++        &job.scene,
++        &textures,
++        &view,
++        job.width,
++        job.height,
++        color.white(),
++      )
++      if let Option<Stamps>.Some { value: s } = &stamps {
++        run stamp(&mut encoder, &s, 2)
++        encoder.resolveQuerySet(&s.set, 0, 4, &s.resolved, 0)
++        encoder.copyBufferToBuffer(&s.resolved, 0, &s.read, 0, STAMP_BYTES)
++      }
++      let finished = run encoder.finish(b"ui frame")
++      queue.submit(&[finished.reference()])
++    } else if canCopy {
+       run renderer.drawReadable(
+         &device,
+         &queue,
+@@ -2300,6 +2468,30 @@ effect fn renderLoop(
+     placeLayers(&mut layered)
+     run device.checkErrors()
+     let presented = run seconds(&mut clock)
++    if settings.timed {
++      run runtime.onSubmittedWorkDone(&device, &queue)
++      let completed = run seconds(&mut clock)
++      let mut exec = -1.0
++      if let Option<Stamps>.Some { value: s } = &stamps {
++        let bytes = run runtime.mapRead(&device, &s.read, 0, u64.toUsize(STAMP_BYTES))
++        let begin = stampAt(bytes.asSlice(), 0)
++        let end = stampAt(bytes.asSlice(), 3)
++        if end > begin {
++          exec = u64.toF64(end - begin) / 1000000.0
++        }
++      }
++      let readDone = run seconds(&mut clock)
++      recordGpu(
++        shared,
++        GpuTimes {
++          wait: (completed - presented) * 1000.0,
++          exec: exec,
++          readback: (readDone - completed) * 1000.0,
++          prepare: (start - workStart) * 1000.0,
++          completedAt: completed,
++        },
++      )
++    }
+     let report = RenderReport {
+       frames: 0,
+       painted: if fresh {

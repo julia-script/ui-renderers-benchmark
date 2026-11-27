@@ -219,6 +219,7 @@
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         performance.mark("xb:initial:end");
+        performance.mark(`xb:env:dpr=${devicePixelRatio},vw=${innerWidth},vh=${innerHeight}`);
         const nodeCount = document.querySelectorAll("*").length;
         window.__XB_NODES = nodeCount;
         if (mode === "initial") {

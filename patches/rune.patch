@@ -1,0 +1,15 @@
+diff --git a/crates/rune/src/render/upload.rs b/crates/rune/src/render/upload.rs
+index 35984fd..41cedd9 100644
+--- a/crates/rune/src/render/upload.rs
++++ b/crates/rune/src/render/upload.rs
+@@ -214,7 +214,9 @@ impl Renderer {
+ 
+     /// The default UI pass draws the root into one known target. Its float intermediate layers
+     /// have their own projection and keep their source precision in the shader.
+-    pub(crate) fn prepare_ui(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, atlas: &mut Atlas,
++    /// Public (hidden) so a compositor can reproduce `Frame::draw_ui` exactly around a timed draw.
++    #[doc(hidden)]
++    pub fn prepare_ui(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, atlas: &mut Atlas,
+         instances: &[Instance], viewport: (u32, u32)) {
+         let bytes = self.srgb_blend && matches!(self.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm);
+         self.prepare_with_precision(device, queue, atlas, instances, viewport, bytes);

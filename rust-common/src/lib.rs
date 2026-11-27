@@ -2,7 +2,7 @@
 
 pub const WIDTH: f32 = 1040.0;
 pub const HEIGHT: f32 = 720.0;
-pub const INITIAL_MESSAGES: usize = 500;
+pub const INITIAL_MESSAGES: usize = 1000;
 pub const SCROLL_FRAMES: usize = 30;
 pub const STREAM_FRAMES: usize = 30;
 pub const SCROLL_STEP: f32 = 480.0;
@@ -111,7 +111,7 @@ fn parse_spans(s: &str) -> Vec<Span> {
 }
 
 pub fn parse_corpus() -> Vec<Message> {
-    let mut messages: Vec<Message> = Vec::with_capacity(520);
+    let mut messages: Vec<Message> = Vec::with_capacity(INITIAL_MESSAGES + 20);
     for line in CHAT_TXT.lines() {
         if let Some(rest) = line.strip_prefix("M|") {
             let parts: Vec<&str> = rest.split('|').collect();

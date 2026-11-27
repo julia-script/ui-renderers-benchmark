@@ -226,7 +226,7 @@ def main():
     STREAM_N = 30
     out = {
         "framework": "Chromium (Chrome 158)",
-        "messages": 500,
+        "messages": 1000,
         "initial": initial,
         "scroll_total": scroll,
         "scroll_per_frame": {k: (v / SCROLL_N if isinstance(v, float) else v) for k, v in scroll.items()},
@@ -237,7 +237,7 @@ def main():
     with open(out_path, "w") as f:
         json.dump(out, f, indent=2)
 
-    print("=== CHROMIUM INITIAL (Cold -> First Frame, 500 chat messages) ===")
+    print("=== CHROMIUM INITIAL (Cold -> First Frame, 1000 chat messages) ===")
     print(f"  Total cold wall:       {initial['cold_total_ms']:7.2f} ms")
     print(f"  --- Before Layout (Chromium overhead + page setup) ---")
     print(f"  Browser init:          {initial['browser_init_ms']:7.2f} ms")
@@ -246,7 +246,7 @@ def main():
     print(f"  HTML parse:            {initial['html_parse_ms']:7.2f} ms")
     print(f"  CSS parse:             {initial['css_parse_ms']:7.2f} ms")
     print(f"  V8 compile:            {initial['v8_compile_ms']:7.2f} ms")
-    print(f"  JS/DOM build (500msg): {initial['dom_build_ms']:7.2f} ms")
+    print(f"  JS/DOM build (1000msg): {initial['dom_build_ms']:7.2f} ms")
     print(f"  JS other:              {initial['js_other_ms']:7.2f} ms")
     print(f"  Font load/decode:      {initial['font_load_ms']:7.2f} ms")
     print(f"  Style recalc:          {initial['style_ms']:7.2f} ms")
