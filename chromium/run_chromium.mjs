@@ -8,7 +8,9 @@ import { spawn } from "node:child_process";
 const ROOT = path.resolve(import.meta.dirname, "..");
 const DATA_JSON = path.join(ROOT, "data", "chat.json");
 const DATA_JS = path.join(ROOT, "data", "chat-data.js");
-const USE_GPU = process.argv.includes("--gpu") || process.env.XB_GPU === "1";
+const WINDOWED = process.argv.includes("--windowed") || process.env.XB_WINDOWED === "1";
+// Windowed = the production path: real window, GPU raster + compositing, native scale, vsync.
+const USE_GPU = WINDOWED || process.argv.includes("--gpu") || process.env.XB_GPU === "1";
 
 function findChrome() {
   if (process.env.CHROME_BIN) return process.env.CHROME_BIN;
@@ -76,27 +78,47 @@ const TRACE_CATS = [
   "gpu",
 ].join(",");
 
-const args = [
-  "--headless=new",
-  "--no-sandbox",
-  ...(USE_GPU ? [] : ["--disable-gpu", "--disable-gpu-compositing"]),
-  "--disable-frame-rate-limit",
-  "--disable-gpu-vsync",
-  "--disable-extensions",
-  "--disable-background-networking",
-  "--disable-sync",
-  "--metrics-recording-only",
-  "--no-first-run",
-  "--window-size=1040,720",
-  "--force-device-scale-factor=1",
-  `--remote-debugging-port=${debugPort}`,
-  `--user-data-dir=${path.join(tmpDir, "profile")}`,
-  `--trace-startup=${TRACE_CATS}`,
-  "--trace-startup-format=json",
-  `--trace-startup-file=${traceFile}`,
-  "--trace-startup-duration=6",
-  `http://127.0.0.1:${port}/chromium/index.html`,
-];
+const pageUrl = `http://127.0.0.1:${port}/chromium/index.html`;
+const args = WINDOWED
+  ? [
+      // Chromeless app window; +32 px for the macOS title bar so the viewport is 1040 x 720.
+      "--window-size=1040,752",
+      "--window-position=80,80",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-sync",
+      "--metrics-recording-only",
+      `--remote-debugging-port=${debugPort}`,
+      `--user-data-dir=${path.join(tmpDir, "profile")}`,
+      `--trace-startup=${TRACE_CATS}`,
+      "--trace-startup-format=json",
+      `--trace-startup-file=${traceFile}`,
+      "--trace-startup-duration=10",
+      `--app=${pageUrl}`,
+    ]
+  : [
+      "--headless=new",
+      "--no-sandbox",
+      ...(USE_GPU ? [] : ["--disable-gpu", "--disable-gpu-compositing"]),
+      "--disable-frame-rate-limit",
+      "--disable-gpu-vsync",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-sync",
+      "--metrics-recording-only",
+      "--no-first-run",
+      "--window-size=1040,720",
+      "--force-device-scale-factor=1",
+      `--remote-debugging-port=${debugPort}`,
+      `--user-data-dir=${path.join(tmpDir, "profile")}`,
+      `--trace-startup=${TRACE_CATS}`,
+      "--trace-startup-format=json",
+      `--trace-startup-file=${traceFile}`,
+      "--trace-startup-duration=6",
+      pageUrl,
+    ];
 
 const chromeBin = findChrome();
 const t0 = performance.now();
@@ -163,4 +185,4 @@ fs.mkdirSync(path.dirname(outTrace), { recursive: true });
 fs.copyFileSync(traceFile, outTrace);
 fs.rmSync(tmpDir, { recursive: true, force: true });
 
-console.log(JSON.stringify({ ok: true, gpu: USE_GPU, code, doneAtMs: +doneAt.toFixed(1), wallMs: +wallMs.toFixed(1), traceBytes: fs.statSync(outTrace).size }));
+console.log(JSON.stringify({ ok: true, gpu: USE_GPU, windowed: WINDOWED, code, doneAtMs: +doneAt.toFixed(1), wallMs: +wallMs.toFixed(1), traceBytes: fs.statSync(outTrace).size }));

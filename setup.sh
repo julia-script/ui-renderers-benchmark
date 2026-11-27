@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-echo "==> Generating shared 500-message chat dataset..."
+echo "==> Generating shared 1000-message chat dataset..."
 python3 "$ROOT/gen_chat.py"
 
 # 1. SilkUI (use existing SILKUI=... env var or shallow-clone silk-lang/SilkUI)
@@ -20,6 +20,10 @@ fi
 if ! grep -q 'ui_tree.text.shape' "$SILKUI_DIR/modules/tree/src/provider.silk"; then
   echo "==> Patching SilkUI provider.silk for text shaping spans..."
   git -C "$SILKUI_DIR" apply "$ROOT/patches/silk-provider-trace.patch"
+fi
+if ! grep -q 'pub timed: bool' "$SILKUI_DIR/modules/tree/window/src/render_thread.silk"; then
+  echo "==> Patching SilkUI render thread for windowed GPU timing..."
+  git -C "$SILKUI_DIR" apply "$ROOT/patches/silk-window-timed.patch"
 fi
 SILK_VER=$(grep -m1 -oh '"0\.1\.0-dev\.[^"]*"' "$SILKUI_DIR/silk.toml" | tr -d '"')
 LIB_FONTS_REV=$(grep -m1 -oE 'lib-fonts\.git", rev = "[0-9a-f]{40}' "$SILKUI_DIR/modules/tree/silk.toml" | grep -oE '[0-9a-f]{40}')
@@ -39,6 +43,10 @@ if [[ ! -d "$ROOT/rune/vendor/rune/.git" ]]; then
   git -C "$ROOT/rune/vendor/rune" remote add origin https://github.com/anomalyco/rune.git
   git -C "$ROOT/rune/vendor/rune" fetch -q --depth 1 origin "$RUNE_REV"
   git -C "$ROOT/rune/vendor/rune" checkout -q FETCH_HEAD
+fi
+if ! grep -q 'Public (hidden) so a compositor' "$ROOT/rune/vendor/rune/crates/rune/src/render/upload.rs"; then
+  echo "==> Patching Rune for the windowed harness..."
+  git -C "$ROOT/rune/vendor/rune" apply "$ROOT/patches/rune.patch"
 fi
 
 # 3. GPUI (zed-industries/zed v1.29.2 sparse checkout; zed-industries/gpui is currently README-only)
@@ -85,7 +93,7 @@ if [[ ! -d "$ROOT/ferroui/vendor/ferroui-base" ]]; then
   tar -xzf /tmp/ferroui-base-0.5.0.crate -C "$ROOT/ferroui/vendor"
   mv "$ROOT/ferroui/vendor/ferroui-base-0.5.0" "$ROOT/ferroui/vendor/ferroui-base"
   rm -f /tmp/ferroui-base-0.5.0.crate
-  patch -p1 -d "$ROOT/ferroui/vendor/ferroui-base/src" < "$ROOT/patches/ferroui-base.patch"
+  patch -p1 -d "$ROOT/ferroui/vendor/ferroui-base" < "$ROOT/patches/ferroui-base.patch"
 fi
 
 echo "==> Setup complete! Run ./build.sh next."

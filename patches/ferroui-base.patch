@@ -1,7 +1,7 @@
 diff -ruN a/bench_prof.rs b/bench_prof.rs
---- a/bench_prof.rs	1970-01-01 00:00:00.000000000 +0000
-+++ b/bench_prof.rs	2026-11-27 21:02:14.166154558 +0000
-@@ -0,0 +1,162 @@
+--- a/bench_prof.rs	1969-12-31 21:00:00
++++ b/bench_prof.rs	2026-11-27 20:02:40
+@@ -0,0 +1,197 @@
 +//! Lightweight atomic phase profiler inside ferroui-base for chat-bench.
 +use std::cell::Cell;
 +use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -16,6 +16,11 @@ diff -ruN a/bench_prof.rs b/bench_prof.rs
 +pub static TEXT_SHAPE_CALLS: AtomicU64 = AtomicU64::new(0);
 +pub static PAINT_PREP_NS: AtomicU64 = AtomicU64::new(0);
 +pub static RASTER_NS: AtomicU64 = AtomicU64::new(0);
++/// CPU time of the end of a frame's drawing contexts: Skia flush (Graphite snap + insert_recording
++/// + submit) and the native present commit. Nested inside RASTER_NS.
++pub static GPU_ENCODE_NS: AtomicU64 = AtomicU64::new(0);
++/// Frames a composition target actually drew (ServerCompositionTarget::render_frame).
++pub static FRAMES_DRAWN: AtomicU64 = AtomicU64::new(0);
 +
 +thread_local! {
 +    static IN_LAYOUT: Cell<u32> = const { Cell::new(0) };
@@ -23,6 +28,7 @@ diff -ruN a/bench_prof.rs b/bench_prof.rs
 +    static IN_TEXT: Cell<u32> = const { Cell::new(0) };
 +    static IN_PAINT: Cell<u32> = const { Cell::new(0) };
 +    static IN_RASTER: Cell<u32> = const { Cell::new(0) };
++    static IN_ENCODE: Cell<u32> = const { Cell::new(0) };
 +}
 +
 +#[derive(Default, Debug, Clone, Copy)]
@@ -36,6 +42,8 @@ diff -ruN a/bench_prof.rs b/bench_prof.rs
 +    pub text_shape_calls: u64,
 +    pub paint_prep_ns: u64,
 +    pub raster_ns: u64,
++    pub gpu_encode_ns: u64,
++    pub frames_drawn: u64,
 +}
 +
 +pub fn reset() {
@@ -48,6 +56,8 @@ diff -ruN a/bench_prof.rs b/bench_prof.rs
 +    TEXT_SHAPE_CALLS.store(0, Relaxed);
 +    PAINT_PREP_NS.store(0, Relaxed);
 +    RASTER_NS.store(0, Relaxed);
++    GPU_ENCODE_NS.store(0, Relaxed);
++    FRAMES_DRAWN.store(0, Relaxed);
 +}
 +
 +pub fn snapshot() -> Snapshot {
@@ -61,6 +71,8 @@ diff -ruN a/bench_prof.rs b/bench_prof.rs
 +        text_shape_calls: TEXT_SHAPE_CALLS.load(Relaxed),
 +        paint_prep_ns: PAINT_PREP_NS.load(Relaxed),
 +        raster_ns: RASTER_NS.load(Relaxed),
++        gpu_encode_ns: GPU_ENCODE_NS.load(Relaxed),
++        frames_drawn: FRAMES_DRAWN.load(Relaxed),
 +    }
 +}
 +
@@ -164,9 +176,32 @@ diff -ruN a/bench_prof.rs b/bench_prof.rs
 +        }
 +    }
 +}
++
++#[inline]
++pub fn note_frame_drawn() {
++    FRAMES_DRAWN.fetch_add(1, Relaxed);
++}
++
++pub struct GpuEncodeScope(Option<Instant>);
++impl GpuEncodeScope {
++    #[inline]
++    pub fn enter() -> Self {
++        let d = IN_ENCODE.with(|c| { let v = c.get(); c.set(v + 1); v });
++        Self(if d == 0 { Some(Instant::now()) } else { None })
++    }
++}
++impl Drop for GpuEncodeScope {
++    #[inline]
++    fn drop(&mut self) {
++        IN_ENCODE.with(|c| c.set(c.get().saturating_sub(1)));
++        if let Some(t0) = self.0 {
++            GPU_ENCODE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
++        }
++    }
++}
 diff -ruN a/layout/layout_manager.rs b/layout/layout_manager.rs
---- a/layout/layout_manager.rs	2006-07-24 01:21:28.000000000 +0000
-+++ b/layout/layout_manager.rs	2026-11-27 21:58:41.117968702 +0000
+--- a/layout/layout_manager.rs	2026-11-27 20:09:41
++++ b/layout/layout_manager.rs	2026-11-27 19:26:36
 @@ -461,6 +461,7 @@
              self.to_arrange.borrow_mut().begin_loop(MAX_PASSES);
  
@@ -184,8 +219,8 @@ diff -ruN a/layout/layout_manager.rs b/layout/layout_manager.rs
              Self::measure(&root);
              Self::arrange(&root);
 diff -ruN a/lib.rs b/lib.rs
---- a/lib.rs	2006-07-24 01:21:28.000000000 +0000
-+++ b/lib.rs	2026-11-27 21:02:58.029810060 +0000
+--- a/lib.rs	2026-11-27 20:09:41
++++ b/lib.rs	2026-11-27 19:26:36
 @@ -5,6 +5,7 @@
  pub use paste::paste as __paste;
  
@@ -195,8 +230,8 @@ diff -ruN a/lib.rs b/lib.rs
  pub mod controls;
  pub mod data;
 diff -ruN a/media/text_formatting/text_shaper.rs b/media/text_formatting/text_shaper.rs
---- a/media/text_formatting/text_shaper.rs	2006-07-24 01:21:28.000000000 +0000
-+++ b/media/text_formatting/text_shaper.rs	2026-11-27 21:03:02.494176497 +0000
+--- a/media/text_formatting/text_shaper.rs	2026-11-27 20:09:42
++++ b/media/text_formatting/text_shaper.rs	2026-11-27 19:26:36
 @@ -34,6 +34,7 @@
  
      /// Shapes UTF-16 text.
@@ -206,8 +241,8 @@ diff -ruN a/media/text_formatting/text_shaper.rs b/media/text_formatting/text_sh
          self.platform_impl.shape_text(text, options)
      }
 diff -ruN a/rendering/composition/compositing_renderer.rs b/rendering/composition/compositing_renderer.rs
---- a/rendering/composition/compositing_renderer.rs	2006-07-24 01:21:28.000000000 +0000
-+++ b/rendering/composition/compositing_renderer.rs	2026-11-27 21:03:03.782282047 +0000
+--- a/rendering/composition/compositing_renderer.rs	2026-11-27 20:09:41
++++ b/rendering/composition/compositing_renderer.rs	2026-11-27 19:26:36
 @@ -735,6 +735,7 @@
      }
  
@@ -217,8 +252,8 @@ diff -ruN a/rendering/composition/compositing_renderer.rs b/rendering/compositio
          // Before anything is synchronized: a visual that is still out of the tree lets go of
          // its composition visual here, and its former parent is synchronized below.
 diff -ruN a/rendering/composition/server/server_composition_target.rs b/rendering/composition/server/server_composition_target.rs
---- a/rendering/composition/server/server_composition_target.rs	2006-07-24 01:21:28.000000000 +0000
-+++ b/rendering/composition/server/server_composition_target.rs	2026-11-27 21:03:04.474338721 +0000
+--- a/rendering/composition/server/server_composition_target.rs	2026-11-27 20:09:41
++++ b/rendering/composition/server/server_composition_target.rs	2026-11-27 20:02:40
 @@ -371,6 +371,7 @@
      }
  
@@ -227,9 +262,53 @@ diff -ruN a/rendering/composition/server/server_composition_target.rs b/renderin
          self.drew_frame.set(false);
          self.only_presented_held_frame.set(false);
          if self.frame_times.borrow().is_none() && self.slow_frame_ms.is_none() {
+@@ -554,6 +555,7 @@
+             platform_specific_scene_info: self.platform_specific_scene_info(),
+         };
+         self.drew_frame.set(true);
++        crate::bench_prof::note_frame_drawn();
+         let render_bounds = LtrbRect::new(0.0, 0.0, pixel_size.width as f64, pixel_size.height as f64);
+ 
+         // Where the target and its layer allow it, the tree is drawn into
+@@ -572,7 +574,10 @@
+                 self.begin_scene(render_bounds, pixel_size);
+                 let mut context = layer.create_drawing_context();
+                 self.render_root_to_context_with_clip(&compositor, &mut *context, &root);
+-                context.dispose();
++                {
++                    let _encode_prof = crate::bench_prof::GpuEncodeScope::enter();
++                    context.dispose();
++                }
+                 self.record_backdrop_regions();
+                 self.layer_unpresented.set(true);
+                 drawn_ahead = true;
+@@ -649,7 +654,10 @@
+                         if draws {
+                             let mut context = layer.create_drawing_context();
+                             self.render_root_to_context_with_clip(&compositor, &mut *context, &root);
+-                            context.dispose();
++                            {
++                                let _encode_prof = crate::bench_prof::GpuEncodeScope::enter();
++                                context.dispose();
++                            }
+                         } else if !drawn_ahead {
+                             layer.complete_pending_frame();
+                             self.only_presented_held_frame.set(true);
+@@ -679,7 +687,10 @@
+ 
+             self.end_frame(render_bounds);
+         }
+-        render_target_context.dispose();
++        {
++            let _encode_prof = crate::bench_prof::GpuEncodeScope::enter();
++            render_target_context.dispose();
++        }
+         self.report_render_counters();
+ 
+         self.prewarm_effects(&compositor, &render_target, &scene_info);
 diff -ruN a/styled_element.rs b/styled_element.rs
---- a/styled_element.rs	2006-07-24 01:21:28.000000000 +0000
-+++ b/styled_element.rs	2026-11-27 21:02:59.245909973 +0000
+--- a/styled_element.rs	2026-11-27 20:09:41
++++ b/styled_element.rs	2026-11-27 19:26:36
 @@ -685,6 +685,7 @@
                  || !self.theme_applied.get()
                  || !self.templated_parent_theme_applied.get())

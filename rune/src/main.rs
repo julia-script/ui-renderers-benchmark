@@ -1,9 +1,14 @@
-//! Rune benchmark on the shared simulated chat session (500 messages + scroll + stream).
+//! Rune benchmark on the shared simulated chat session (1000 messages + scroll + stream).
 //! Uses Rune's built-in `frame-profile` (`rune::take_frame_phases`) to separate:
 //!   - view / commit / apply (phases[0], phases[1] - phases[2], phases[5])
 //!   - text shaping & line breaking (phases[3])
 //!   - pure layout (phases[2] - phases[3])
 //!   - paint + CPU glyph mask rasterization (phases[4])
+//!
+//! Default: headless (no GPU submit or present). `--windowed`: a real window, GPU and present
+//! (`windowed.rs`).
+
+mod windowed;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -208,6 +213,13 @@ fn ms(d: std::time::Duration) -> f64 {
 }
 
 fn main() {
+    if std::env::args().skip(1).any(|a| a == "--windowed") {
+        return windowed::run();
+    }
+    headless();
+}
+
+fn headless() {
     let t_start = Instant::now();
     let all = parse_corpus();
     let initial_msgs = all[..INITIAL_MESSAGES].to_vec();

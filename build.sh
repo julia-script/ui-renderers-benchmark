@@ -20,7 +20,7 @@ for t in "${TARGETS[@]}"; do
       ;;
     gpui)
       echo "==> Building GPUI..."
-      cargo build --release --manifest-path "$ROOT/gpui/Cargo.toml"
+      (cd "$ROOT/gpui" && cargo build --release)  # rustc from gpui/rust-toolchain.toml
       ;;
     ferroui)
       echo "==> Building FerroUI..."

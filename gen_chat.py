@@ -217,8 +217,8 @@ def write_txt(messages, path):
 
 
 def main():
-    count = 500
-    # Generate 500 initial messages + 20 extra messages for the live streaming phase
+    count = 1000
+    # Generate 1000 initial messages + 20 extra messages for the live streaming phase
     messages = [make_message(i) for i in range(count + 20)]
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
     os.makedirs(out_dir, exist_ok=True)
@@ -247,7 +247,7 @@ def main():
             elif b["kind"] == "h":
                 words += len(b["text"].split())
     print(f"Generated {len(messages)} total messages ({count} initial + 20 stream reserve)")
-    print(f"Initial 500 breakdown: {counts}, total words: {words}")
+    print(f"Initial {count} breakdown: {counts}, total words: {words}")
 
 
 if __name__ == "__main__":

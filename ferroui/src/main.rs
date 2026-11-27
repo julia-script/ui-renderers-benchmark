@@ -1,4 +1,4 @@
-//! FerroUI benchmark on the shared simulated chat session (500 messages + scroll + stream).
+//! FerroUI benchmark on the shared simulated chat session (1000 messages + scroll + stream).
 //! Uses `ferroui_base::bench_prof` counters inside ferroui-base to separate:
 //!   - view / control tree build & reconciliation
 //!   - style application (Fluent theme / StyledElement::try_apply_styling)
@@ -27,11 +27,14 @@ use ferroui_base::threading::Dispatcher;
 use ferroui_base::utilities::UriRef;
 use ferroui_base::{Ref, Vector};
 use ferroui_controls::documents::Run;
-use ferroui_controls::{AppBuilder, Application, ScrollViewer, TextBlock, Window};
+use ferroui_controls::{AppBuilder, Application, ScrollViewer, Window};
 use ferroui_headless::{FerroHeadlessPlatform, FerroHeadlessPlatformExtensions, FerroHeadlessPlatformOptions};
 use ferroui_skia::SkiaApplicationExtensions;
 use ferroui_themes_fluent::FluentTheme;
 use ferroui_view::prelude::*;
+
+#[cfg(target_os = "macos")]
+mod windowed;
 
 const SANS: &str = "fonts:XBench#Inter";
 const MONO_FAMILY: &str = "fonts:XBench#JetBrains Mono";
@@ -60,32 +63,31 @@ fn family(name: &str) -> FontFamily {
 }
 
 fn inline(spans: &[Span], size: f64, line: f64, color: u32, italic: bool) -> Element {
-    let spans: Vec<Span> = spans.to_vec();
+    // The runs go through the `inlines` property (not a mount-only `.with` hook), so a re-rendered
+    // message (streamed words) updates the TextBlock it patches.
+    let inlines = ferroui_controls::documents::InlineCollection::new();
+    for s in spans {
+        let run = Run::with_text(Some(&s.text));
+        match s.mark {
+            Mark::None => {}
+            Mark::Bold => run.set_font_weight(FontWeight::Bold),
+            Mark::Italic => run.set_font_style(FontStyle::Italic),
+            Mark::Code => {
+                run.set_font_family(family(MONO_FAMILY));
+                run.set_font_size(12.5);
+                run.set_background(Some(brush(c::TAG_BG)));
+            }
+            Mark::Link => run.set_foreground(Some(brush(c::LINK))),
+        }
+        inlines.add(run);
+    }
     text_block()
         .text_wrapping(TextWrapping::Wrap)
         .font_size(size)
         .line_height(line)
         .foreground(hex(color))
         .font_style(if italic { FontStyle::Italic } else { FontStyle::Normal })
-        .with(move |tb: &Ref<TextBlock>| {
-            let inlines = ferroui_controls::documents::InlineCollection::new();
-            for s in &spans {
-                let run = Run::with_text(Some(&s.text));
-                match s.mark {
-                    Mark::None => {}
-                    Mark::Bold => run.set_font_weight(FontWeight::Bold),
-                    Mark::Italic => run.set_font_style(FontStyle::Italic),
-                    Mark::Code => {
-                        run.set_font_family(family(MONO_FAMILY));
-                        run.set_font_size(12.5);
-                        run.set_background(Some(brush(c::TAG_BG)));
-                    }
-                    Mark::Link => run.set_foreground(Some(brush(c::LINK))),
-                }
-                inlines.add(run);
-            }
-            tb.set_inlines(Some(inlines));
-        })
+        .inlines(Some(inlines))
         .into()
 }
 
@@ -315,7 +317,8 @@ fn msg_body(m: &Message) -> Element {
         .into()
 }
 
-#[component]
+// `rerender`: memoized on (at, id, version), so only a message whose version changed runs again.
+#[component(rerender)]
 fn MsgView(at: usize, id: usize, version: u64) -> Element {
     let _ = (id, version);
     MESSAGES.with(|ms| msg_body(&ms.borrow()[at]))
@@ -351,6 +354,18 @@ fn ms(d: std::time::Duration) -> f64 {
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--windowed") {
+        #[cfg(target_os = "macos")]
+        windowed::run();
+        #[cfg(not(target_os = "macos"))]
+        panic!("--windowed is implemented for macOS only");
+        #[allow(unreachable_code)]
+        return;
+    }
+    run_headless();
+}
+
+fn run_headless() {
     let t_start = Instant::now();
     let all = parse_corpus();
     let initial_msgs = all[..INITIAL_MESSAGES].to_vec();
